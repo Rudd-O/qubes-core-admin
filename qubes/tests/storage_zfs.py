@@ -1,0 +1,615 @@
+""" Tests for the ZFS storage driver """
+
+# FIXME: copy tests from storage_reflink and storage_lvm when it makes sense.
+# pylint: disable=protected-access
+# pylint: disable=invalid-name
+
+import os
+import shutil
+import subprocess
+import sys
+import unittest
+
+import qubes.storage as storage
+import qubes.storage.zfs as zfs
+import qubes.tests
+import qubes.tests.storage as ts
+import qubes.vm.appvm
+
+from typing import Tuple, Dict, Any, List, Coroutine, Optional
+
+DUMP_POOL_AFTER_EACH_TEST = os.getenv("ZFS_DUMP_POOL_AFTER_EACH_TEST", "")
+# DUMP_POOL_AFTER_EACH_TEST = True
+
+
+def _VOLCFG(pool: str, **kwargs: Any) -> Dict[str, Any]:
+    d = {
+        "name": "root",
+        "pool": pool,
+        "rw": True,
+        "size": 1024 * 1024,
+    }
+    for k, v in kwargs.items():
+        d[k] = v
+    return d
+
+
+def ONEMEG_SAVE_ON_STOP(pool: str, **kwargs: Any) -> Dict[str, Any]:
+    return _VOLCFG(pool, save_on_stop=True, **kwargs)
+
+
+def ONEMEG_SNAP_ON_START(pool: str, **kwargs: Any) -> Dict[str, Any]:
+    return _VOLCFG(pool, snap_on_start=True, **kwargs)
+
+
+def call_no_output(cmd: List[str]) -> int:
+    with open(os.devnull, "ab") as devnull:
+        return subprocess.call(cmd, stdout=devnull, stderr=subprocess.STDOUT)
+
+
+def skip_unless_zfs_available(test_item: Any) -> Any:
+    """Decorator that skips ZFS tests if ZFS is missing."""
+    avail = shutil.which("zfs") and shutil.which("zpool")
+    msg = "Either the zfs command or the zpool command are not available."
+    return unittest.skipUnless(avail, msg)(test_item)
+
+
+class TestApp(qubes.Qubes):
+    """A Mock App object"""
+
+    def __init__(
+        self, *args: Any, **kwargs: Any
+    ) -> None:  # pylint: disable=unused-argument
+        super().__init__(  # type: ignore
+            "/tmp/qubes-zfs-test.xml",
+            load=False,
+            offline_mode=True,
+            **kwargs,
+        )
+        self.load_initial_values()  # type: ignore
+
+
+def setup_test_zfs_pool(pool_name: str) -> Tuple[str, str]:
+    name = pool_name
+    container = f"{name}/vms"
+    want = 32 * 1024 * 1024 * 1024
+
+    def freebytes(directory: str, without: str) -> int:
+        free = os.statvfs(directory).f_blocks * os.statvfs(directory).f_bfree
+        if os.path.isfile(without):
+            # Compute the free space by adding the on-disk usage of the
+            # file `without` to the free space.
+            realsize = int(
+                subprocess.run(
+                    [
+                        "du",
+                        "--block-size=1",
+                        without,
+                    ],
+                    capture_output=True,
+                    check=True,
+                    universal_newlines=True,
+                ).stdout.split()[0]
+            )
+            free += realsize
+        return free
+
+    if os.path.ismount("/rw") and freebytes("/rw", f"/rw/{name}.img") > want:
+        data_file = f"/rw/{name}.img"
+    elif freebytes("/var/tmp", f"/var/tmp/{name}.img") > want:
+        data_file = f"/var/tmp/{name}.img"
+    else:
+        assert 0, (
+            "not enough disk space (32GiB) in /rw or "
+            "/var/tmp to proceed with test ZFS pool creation"
+        )
+    with open(data_file, "wb") as f:
+        f.seek(want - 1)
+        f.write(b"\0")
+
+    listres = call_no_output(["zpool", "list", pool_name])
+    if listres == 0:
+        cmd = ["zpool", "destroy", "-f", pool_name]
+        subprocess.check_call(cmd)
+    cmd = ["zpool", "create", "-f", pool_name, data_file]
+    subprocess.check_call(cmd)
+    return data_file, container
+
+
+def teardown_test_zfs_pool(data_file: str, pool_name: str) -> None:
+    cmd = ["zpool", "destroy", pool_name]
+    subprocess.check_call(cmd)
+    os.unlink(data_file)
+
+
+def dump_zfs_filesystems(text: str = "") -> None:
+    print(text, file=sys.stderr)
+    subprocess.call("zfs list -t all -o name,origin,used >&2", shell=True)
+
+
+class ZFSBase(qubes.tests.QubesTestCase):
+    pool_name = None
+    container = None
+    data_file = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.pool_name = "testpool"
+        cls.data_file, cls.container = setup_test_zfs_pool(
+            cls.pool_name,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        assert cls.data_file
+        assert cls.pool_name
+        teardown_test_zfs_pool(
+            cls.data_file,
+            cls.pool_name,
+        )
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        super().setUp()  # type:ignore
+        pool_conf = {
+            "driver": "zfs",
+            "container": self.container,
+            "name": "test-zfs",
+        }
+        self.app = TestApp()
+        self.pool: zfs.ZFSPool = self.rc(
+            self.app.add_pool(**pool_conf),  # type: ignore
+        )
+        self.app.default_pool = self.app.get_pool(
+            pool_conf["name"],
+        )  # type: ignore
+
+    def tearDown(self) -> None:
+        self.app.default_pool = "varlibqubes"
+        self.rc(self.app.remove_pool(self.pool.name))  # type: ignore
+        del self.pool
+        self.app.close()  # type: ignore
+        del self.app
+        super().tearDown()
+        # Dump if dumped.
+        if DUMP_POOL_AFTER_EACH_TEST:
+            self.dump()
+
+    def rc(self, future: Coroutine[Any, Any, Any]) -> Any:
+        return self.loop.run_until_complete(future)  # type:ignore
+
+    def dump(self, text: str = "") -> None:
+        return dump_zfs_filesystems(text)
+
+    def assert_dataset_exists(self, dataset: str) -> None:
+        assert (
+            call_no_output(["zfs", "list", dataset]) == 0
+        ), f"{dataset} does not exist"
+
+    def assert_dataset_does_not_exist(self, dataset: str) -> None:
+        try:
+            self.assert_dataset_exists(dataset)
+        except AssertionError:
+            return
+        assert 0, f"{dataset} exists when it should not"
+
+
+@skip_unless_zfs_available
+class TC_10_ZFSPool(ZFSBase):
+
+    vols_created_during_test: Optional[List[zfs.ZFSVolume]] = None
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.vols_created_during_test = []
+
+    def tearDown(self) -> None:
+        if self.vols_created_during_test:
+            for v in self.vols_created_during_test:
+                # Lazy cleanup here.
+                self.rc(v.stop())
+                self.rc(v.remove())
+        super().tearDown()
+
+    def get_vol(self, factory: Any, **kwargs: Any) -> zfs.ZFSVolume:
+        volume = self.pool.init_volume(
+            ts.TestVM(self),  # type:ignore
+            factory(self.pool.name, **kwargs),
+        )
+        assert isinstance(self.vols_created_during_test, list)
+        self.vols_created_during_test.insert(0, volume)
+        return volume
+
+    def test_000_harness(self) -> None:
+        """No test.  If this passes the test harness worked."""
+        pass
+
+    def test_010_create_remove_saveonstop(self) -> None:
+        """
+        Test that a save_on_stop volume can be created and exists, then that
+        it can be torn down and it vanished after teardown.
+        """
+        volume = self.get_vol(ONEMEG_SAVE_ON_STOP)
+        self.rc(volume.create())
+        self.assert_dataset_exists(volume.volume)
+        self.rc(volume.remove())
+        self.assert_dataset_does_not_exist(volume.volume)
+
+    def test_011_saveonstop_persists_data(self) -> None:
+        """
+        Test that a save-on-stop volume saves data across `stop()`/`start()`.
+        """
+        volume = self.get_vol(ONEMEG_SAVE_ON_STOP)
+        self.rc(volume.create())
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+            v.write("test data")
+        self.rc(volume.stop())
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "r") as v:
+            r = v.read(10)
+        assert r.startswith("test data"), "volume did not persist data"
+
+    def test_012_export_import(self) -> None:
+        """
+        Test that writing to an exported volume does not make data go into the
+        volume, but that *importing* data to the volume does make the data go
+        into the volume.
+        """
+        volume = self.get_vol(ONEMEG_SAVE_ON_STOP)
+        self.rc(volume.create())
+
+        # Export volume to device.
+        volume_exported = self.rc(volume.export())
+        # Write to the exported device.  This should NOT make it into the
+        # volume data, as the exported device is independent of the volume.
+        with open(volume_exported, "w") as volume_file:
+            volume_file.write("test data")
+        # Unexport the volume.
+        self.rc(volume.export_end(volume_exported))
+
+        # Export volume to device again.
+        volume_exported = self.rc(volume.export())
+        # Read from the exported device, verifying the data did not
+        # make it into the volume.
+        with open(volume_exported) as volume_file:
+            data = volume_file.read(20)
+        assert not data.startswith("test data")
+        # Unexport the volume.
+        self.rc(volume.export_end(volume_exported))
+
+        # Import the following (zero-length) data into the volume.
+        import_path = self.rc(volume.import_data(volume.size))
+        with open(import_path, "w+") as volume_file:
+            volume_file.write("test data")
+        self.rc(volume.import_data_end(True))
+        self.assertFalse(
+            os.path.exists(import_path),
+            f"{import_path} was not removed",
+        )
+
+        # Export the volume again to check that the data was imported.
+        volume_exported = self.rc(volume.export())
+        with open(volume_exported) as volume_file:
+            data = volume_file.read(20)
+        assert data.startswith("test data")
+        # Unexport the volume.
+        self.rc(volume.export_end(volume_exported))
+
+    def test_013_resize_saveonstop(self) -> None:
+        """Test that a volume can be enlarged, but cannot be shrunk."""
+        volume = self.get_vol(ONEMEG_SAVE_ON_STOP)
+        self.rc(volume.create())
+
+        # Enlarge!
+        newsize = 2 * 1024 * 1024
+        self.rc(volume.resize(newsize))
+        self.assertEqual(
+            volume.size,
+            newsize,
+            f"volume.size {volume.size} != newsize {newsize}",
+        )
+
+        # Fail at shrinking.
+        self.assertRaises(
+            storage.StoragePoolException,
+            lambda: self.rc(
+                volume.resize(1024 * 1024),
+            ),
+        )
+
+    def test_014_snaponstart_forgets_data(self) -> None:
+        """
+        Test that a snap-on-start volume drops data across `stop()`/`start()`.
+        """
+        # Create source volume, to clone the snap-on-start
+        # volume from
+        source = self.get_vol(ONEMEG_SAVE_ON_STOP, name="014")
+        self.rc(source.create())
+        # Create the snap-on-start volume.
+        volume = self.get_vol(
+            ONEMEG_SNAP_ON_START,
+            source=source,
+            name="rootclone",
+        )
+        self.rc(volume.create())
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+            v.write("test data")
+        self.rc(volume.stop())
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "r") as v:
+            r = v.read(10)
+        assert not r.startswith("test data"), "volume persisted data"
+
+    def test_015_saveonstop_usage(self) -> None:
+        """
+        Test disk space usage of a save-on-stop volume.
+        """
+        volume = self.get_vol(ONEMEG_SAVE_ON_STOP, name="015")
+        self.rc(volume.create())
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+            v.write("0123456789abcdef" * 1024 * int(1024 / 16))
+        self.rc(volume.stop())
+        # The data usage will never equal 1 meg because ZFS
+        # does RLE compression and other forms of compression too.
+        assert volume.usage > 0
+
+    def test_016_resize_saveonstop(self) -> None:
+        """Test that a volume does in fact enlarge after start."""
+        volume = self.get_vol(ONEMEG_SAVE_ON_STOP, name="016")
+        self.rc(volume.create())
+        self.rc(volume.start())
+
+        def seekandwrite() -> None:
+            with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w") as v:
+                v.seek(1536 * 1024)  # seek past one meg
+                v.write("hells yeah")
+
+        # This must fail
+        self.assertRaises(OSError, seekandwrite)
+
+        # Enlarge!
+        self.rc(volume.resize(2 * 1024 * 1024))
+        # This must not fail.
+        seekandwrite()
+        self.rc(volume.stop())
+
+    def test_017_saveonstop_can_revert(self) -> None:
+        """
+        Test that a save-on-stop volume reverts successfully.
+        """
+        volume = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="017",
+            revisions_to_keep=2,  # Otherwise our first snapshot bye bye.
+        )
+        # Make the volume.
+        self.rc(volume.create())
+        # Make a note of the latest clean snapshot (all zeros).
+        snapshot_before_start, _ = volume.latest_revision
+        # Start and write some data to it, then stop.
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+            v.write("test data")
+        self.rc(volume.stop())
+        # Now revert.  Our volume should no longer contain what we
+        # recently wrote to it.
+        self.rc(volume.revert(snapshot_before_start))
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "r") as v:
+            r = v.read(10)
+        assert not r.startswith("test data"), "volume did not revert"
+        self.rc(volume.stop())
+
+    def test_018_saveonstop_clone_correct_data_when_clean(self) -> None:
+        """
+        Test that the clone of a save-on-stop volume, performed right after
+        stop (when it's clean), contains the data written to the volume
+        during execution of the VM.
+        """
+        volume = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="018",
+        )
+        # Make the volume.
+        self.rc(volume.create())
+        # Start and write some data to it, then stop.
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+            v.write("test 018")
+        self.rc(volume.stop())
+
+        # Let's clone volume2 from volume.
+        volume2 = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="018-2",
+            # No source, we later import it using Qubes codebase.
+        )
+        self.rc(volume2.create())
+        self.rc(volume2.import_volume(volume))
+
+        # Check that we imported the very latest data from the
+        # (clean after stop) volume.
+        # Test prompted by Debu's observations.
+        with open(os.path.join(zfs.ZVOL_DIR, volume2.volume), "r") as v:
+            r = v.read(10)
+        assert r.startswith("test 018"), "volume did not commit correctly"
+        self.rc(volume2.stop())
+
+    def test_019_saveonstop_clone_correct_data_when_dirty(self) -> None:
+        """
+        Test that the clone of a save-on-stop volume, performed when the VM
+        is running (and the volume is therefore dirty), contains the data
+        written to the volume before start of the VM.
+        """
+        volume = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="019",
+        )
+        # Make the volume.
+        self.rc(volume.create())
+        # Start and write some data to it, then stop.
+        self.rc(volume.start())
+        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+            v.write("test 019")
+
+        # Let's clone volume2 from volume.
+        volume2 = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="019-2",
+            # No source, we later import it using Qubes codebase.
+        )
+        self.rc(volume2.create())
+        self.rc(volume2.import_volume(volume))
+
+        # Check that we imported the very latest data from the
+        # (clean after stop) volume.
+        # Test prompted by Debu's observations.
+        with open(os.path.join(zfs.ZVOL_DIR, volume2.volume), "r") as v:
+            r = v.read(10)
+        assert not r.startswith("test 019"), "volume did not commit correctly"
+        self.rc(volume2.stop())
+        self.rc(volume.stop())
+
+    def test_020_saveonstop_clone_from_snaponstart(self) -> None:
+        """
+        Ensure a snap on start volume only sees the contents of its source
+        once its source has been stopped (therefore is clean), the snap on
+        start volume has been stopped, and then started again.
+
+        This behavior is what you see when you turn off your TemplateVM,
+        turn off your AppVM and restart the AppVM once again -- the *clean*
+        contents of the root file system of the TemplateVM become visible
+        to the AppVM, but *only after both* were shut off.
+        """
+        # Create source volume, to clone the snap-on-start
+        # volume from
+        source = self.get_vol(ONEMEG_SAVE_ON_STOP, name="020")
+        self.rc(source.create())
+
+        # Create target volume, the import from source volume.
+        # This should never be the case.  Snap on start volumes
+        # must instead be *sourced* from a save on stop volume.
+        self.assertRaises(
+            storage.StoragePoolException,
+            lambda: self.get_vol(ONEMEG_SNAP_ON_START, name="020-2"),
+        )
+
+        # Create target volume by using the source mechanism.
+        # This should work correctly.
+        target = self.get_vol(
+            ONEMEG_SNAP_ON_START,
+            name="020-3",
+            source=source,
+        )
+        self.rc(target.create())
+        self.rc(target.start())
+        with open(os.path.join(zfs.ZVOL_DIR, target.volume), "rb") as v:
+            r = v.read(1)
+        # Should be all zeroes, since it cloned from the empty
+        # save on stop volume, recently created.
+        self.assertEqual(r, b"\0")
+
+        # Now let's write to the source volume, see how this goes.
+        self.rc(source.start())
+        with open(os.path.join(zfs.ZVOL_DIR, source.volume), "w+") as v:
+            v.write("test 020")
+
+        # Should still be all zeroes, since the clone must have proceeded
+        # from the clean snapshot of the now-dirty save on stop volume.
+        with open(os.path.join(zfs.ZVOL_DIR, target.volume), "rb") as v:
+            r = v.read(1)
+        self.assertEqual(r, b"\0")
+
+        # Now let's stop the source, stop the target, and start the target
+        # once again.
+        self.rc(source.stop())
+        self.rc(target.stop())
+        self.rc(target.start())
+
+        # Now, since both the target and the source were stopped, and
+        # therefore are clean, upon new start of the target, it should
+        # have the data written to the source before stop.
+        with open(os.path.join(zfs.ZVOL_DIR, target.volume), "r") as v:
+            rstr = v.read(8)
+        self.assertEqual(rstr, "test 020")
+
+    def test_021_saveonstop_clone_removed_lifo(self) -> None:
+        """
+        Ensure a save on stop volume and its save on stop clone can be created,
+        then that the clone and the save on stop volume can be removed, in
+        that order.
+
+        This is the natural order in which we expect removals to happen,
+        although another test case covers the opposite removal order.
+        """
+        # Create source volume.
+        source = self.get_vol(ONEMEG_SAVE_ON_STOP, name="021")
+        self.rc(source.create())
+        self.rc(source.start())
+        self.rc(source.stop())
+
+        # Let's import clone from source, start then stop it.
+        clone = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="021-import",
+        )
+        self.rc(clone.create())
+        self.rc(clone.import_volume(source))
+        self.rc(clone.start())
+        self.rc(clone.stop())
+
+        self.rc(clone.remove())
+        self.rc(source.remove())
+
+    def test_022_saveonstop_clone_removed_fifo(self) -> None:
+        """
+        Ensure a save on stop volume and its save on stop clone can be created,
+        then that the save on stop volume can be removed *first* and the clone
+        removed last.
+        """
+        # Create source volume.
+        source = self.get_vol(ONEMEG_SAVE_ON_STOP, name="022")
+        self.rc(source.create())
+        self.rc(source.start())
+        self.rc(source.stop())
+
+        # Let's import clone from source, start then stop it.
+        clone = self.get_vol(
+            ONEMEG_SAVE_ON_STOP,
+            name="022-import",
+        )
+        self.rc(clone.create())
+        self.rc(clone.import_volume(source))
+        self.rc(clone.start())
+        self.rc(clone.stop())
+
+        # Now we remove the source.  Obviously the source's snapshots must be
+        # promoted by the code to the clone, so the source can then be deleted.
+        self.rc(source.remove())
+        self.rc(clone.remove())
+
+    def test_023_forensics_feature(self) -> None:
+        """
+        Ensure a forensics-enable snap-on-start volume is conserved when
+        the volume is stopped.
+        """
+        # Create source volume.
+        source = self.get_vol(ONEMEG_SAVE_ON_STOP, name="023")
+        self.rc(source.create())
+
+        cloned = self.get_vol(
+            ONEMEG_SNAP_ON_START,
+            name="023-clone",
+            source=source,
+            snap_on_start_forensics=True,
+        )
+        self.rc(cloned.create())
+        self.rc(cloned.start())
+        self.rc(cloned.stop())
+
+        # Now check the dataset exists.
+        self.assert_dataset_exists(cloned.volume)

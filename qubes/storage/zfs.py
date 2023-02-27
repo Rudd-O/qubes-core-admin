@@ -1,0 +1,2170 @@
+"""
+Driver for storing qube images in ZFS pool volumes.
+"""
+
+import asyncio
+import logging
+import os
+import shlex
+import shutil
+import subprocess
+import time
+
+import qubes
+import qubes.storage
+import qubes.utils
+
+from threading import RLock
+from typing import (
+    cast,
+    Optional,
+    TypedDict,
+    Dict,
+    List,
+    Union,
+    Any,
+    Tuple,
+    Coroutine,
+    Literal,
+    Callable,
+    Type,
+    Set,
+)
+
+ZVOL_DIR = "/dev/zvol"
+EXPORTED = ".exported"
+REVISION_PREFIX = "qubes"
+IMPORT_DATA_SUFFIX = "-import-data"
+_sudo, _dd, _zfs, _zpool = "sudo", "dd", "zfs", "zpool"
+LOGGER = logging.getLogger(__name__)
+
+
+def boolify(val: Any) -> bool:
+    """Make input `val` into a bool."""
+    if isinstance(val, bool):
+        return bool(val)
+    return str(val) in [
+        "1",
+        "true",
+        "on",
+        "True",
+        "enabled",
+    ]
+
+
+async def fail_unless_exists_async(p: str) -> None:
+    if os.path.exists(p):
+        return
+    s = f"Device path {p} never appeared"
+    raise qubes.storage.StoragePoolException(s)
+
+
+async def retry_async(
+    callable: Callable[[], Coroutine[None, None, Any]],
+    exception_class: Type[BaseException],
+    times: int,
+    sleep_between_tries: float,
+) -> Any:
+    counter = times
+    while True:
+        try:
+            v = await callable()
+            return v
+        except exception_class:
+            counter = counter - 1
+            if counter < 1:
+                raise
+            await asyncio.sleep(sleep_between_tries)
+
+
+async def wait_for_device_async(devpath: str) -> str:
+    await retry_async(
+        lambda: fail_unless_exists_async(devpath),
+        qubes.storage.StoragePoolException,
+        1000,
+        0.01,
+    )
+    return devpath
+
+
+def dataset_in_root(dataset: str, root: str) -> bool:
+    """
+    Checks that a dataset is within a root.
+
+    >>> dataset_in_root("a/b", "a")
+    True
+    >>> dataset_in_root("a", "a")
+    True
+    >>> dataset_in_root("a/b", "a/c")
+    False
+    """
+    return dataset == root or (dataset + "/").startswith(root + "/")
+
+
+def timestamp_to_revision(timestamp: Union[int, str, float], cause: str) -> str:
+    """
+    Converts a timestamp to a revision.
+
+    >>> timestamp_to_revision(123, "a")
+    qubes:a:123
+    >>> timestamp_to_revision(123.1, "b")
+    qubes:b:123
+    >>> timestamp_to_revision("123", "C")
+    qubes:C:123
+    """
+    return "%s:%s:%.6f" % (REVISION_PREFIX, cause, float(timestamp))
+
+
+def is_revision_dataset(fsname: str) -> bool:
+    """
+    Verifies that a snapshot name is a revision snapshot.
+
+    >>> is_revision_dataset("testvol/vm/private@qubes:123")
+    True
+    >>> is_revision_dataset("testvol/vm/private@qubes:after-x:123")
+    True
+    >>> is_revision_dataset("testvol/vm/private@qubes:after-x:123")
+    False
+    """
+    return fsname.split("@")[-1].startswith(REVISION_PREFIX + ":")
+
+
+def timestamp_from_revision(fsname: str) -> float:
+    """
+    From a revision snapshot name, infer the timeestamp.
+
+    >>> timestamp_from_revision("testvol/vm/private@qubes:123")
+    123.0
+    >>> timestamp_from_revision("testvol/vm/private@qubes:after-x:123")
+    123.0
+    """
+    return float(fsname.split("@")[-1].split(":")[-1])
+
+
+async def dd(
+    inpath: str,
+    outpath: str,
+    log: logging.Logger,
+) -> None:
+    """
+    Byte-copies (sparsely) from inpath to outpath.
+
+    Will print periodic progress info to stderr.
+
+    Raises `qubes.storage.StoragePoolException` if the copy fails.
+    """
+    thecmd = [
+        _dd,
+        "if=" + inpath,
+        "of=" + outpath,
+        "conv=sparse,nocreat",
+        "status=progress",
+        "iflag=direct",
+        "oflag=direct",
+        "bs=1M",
+    ]
+    if not os.access(outpath, os.W_OK) or not os.access(inpath, os.R_OK):
+        thecmd = [_sudo] + thecmd
+    log.debug("Invoked with arguments %r", thecmd)
+    p = await asyncio.create_subprocess_exec(*thecmd)
+    ret = await p.wait()
+    if ret != 0:
+        raise qubes.storage.StoragePoolException(
+            "%s failed with error %s" % (thecmd, ret)
+        )
+
+
+def check_zfs_available() -> None:
+    if not shutil.which(_zfs) or not shutil.which(_zpool):
+        raise qubes.storage.StoragePoolException(
+            "ZFS is not available on this system",
+        )
+
+
+class DatasetBusy(qubes.storage.StoragePoolException):
+    """
+    Dataset is busy.  Causes:
+
+      * associated device file open
+      * fs mounted with open files (not the case for this driver)
+    """
+
+    pass
+
+
+class DatasetHasDependentClones(qubes.storage.StoragePoolException):
+    """
+    Dataset has dependent clones.
+
+    Caused by attempting to remove a snapshot (or a file system / volume
+    containing a snapshot) that is currently cloned to another dataset
+    (file system or volume).
+
+    To remove such datasets, one of its clones must be promoted so that
+    it takes over ownership (and disk space accounting) of the snapshot
+    in question.
+    """
+
+    pass
+
+
+class DatasetDoesNotExist(qubes.storage.StoragePoolException):
+    """
+    Dataset does not exist.
+
+    Raised when an operation with a dataset fails because it cannot
+    be found in the pool (e.g. it was deleted).
+    """
+
+    pass
+
+
+def zfs(
+    *cmd: str,
+    log: logging.Logger,
+) -> str:
+    """
+    Call :program:`zfs` to execute a ZFS operation.
+
+    If the first parameter in cmd is "zpool", then
+    :program:`zpool` is called instead.
+
+    Returns the standard output of the program run.
+
+    Raises a `qubes.storage.StoragePoolException` if the command fails.
+
+    This version is synchronous.
+    """
+    environ = {"LC_ALL": "C.UTF-8", **os.environ}
+    if cmd and cmd[0] == "zpool":
+        thecmd = [_zpool] + list(cmd)[1:]
+    else:
+        thecmd = [_zfs] + list(cmd)
+    if os.getuid() != 0:
+        thecmd = [_sudo] + thecmd
+    thecmd_shell = " ".join(shlex.quote(x) for x in thecmd)
+    try:
+        p = subprocess.Popen(
+            thecmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            env=environ,
+        )
+    except FileNotFoundError as exc:
+        # Oops.  No ZFS.  Raise the appropriate exception.
+        raise qubes.storage.StoragePoolException(
+            "ZFS is not available on this system",
+        ) from exc
+    stdout, stderr = p.communicate()
+    err = "\n".join(line for line in stderr.decode().splitlines())
+    if stdout:
+        log.debug("%s -> %s", thecmd_shell, stdout.decode().rstrip())
+    else:
+        log.debug("%s -> (no output)", thecmd_shell)
+    if p.returncode == 0 and err:
+        log.warning("%s succeeded but produced stderr: %s", thecmd_shell, err)
+    elif p.returncode != 0:
+        log.debug(
+            "%s failed with %s and produced stderr: %s",
+            thecmd_shell,
+            p.returncode,
+            err,
+        )
+        if err.rstrip().endswith("dataset is busy"):
+            raise DatasetBusy(err)
+        if "has dependent clones\n" in err or err.rstrip().endswith(
+            "has dependent clones"
+        ):
+            raise DatasetHasDependentClones(err)
+        if err.rstrip().endswith("dataset does not exist"):
+            raise DatasetDoesNotExist(err)
+        raise qubes.storage.StoragePoolException(err)
+    return stdout.decode()
+
+
+async def zfs_async(
+    *cmd: str,
+    log: logging.Logger,
+) -> str:
+    """
+    Asynchronous version of `zfs()`.
+    """
+
+    def synced() -> str:
+        return zfs(*cmd, log=log)
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, synced)
+
+
+class Vid(str):
+    @classmethod
+    def make(klass, container: str, vm_name: str, volume_name: str) -> "Vid":
+        return Vid("{!s}/{!s}/{!s}".format(container, vm_name, volume_name))
+
+
+class Volume(str):
+    @classmethod
+    def make(klass, name: str) -> "Volume":
+        assert "@" not in name
+        return Volume(name)
+
+    @property
+    def volume(self) -> "Volume":
+        return self
+
+    def add_suffix(self, suffix: str) -> "Volume":
+        return Volume.make(self + suffix)
+
+
+class VolumeSnapshot(str):
+    @classmethod
+    def make(klass, dataset: str, snapshot: str) -> "VolumeSnapshot":
+        assert "@" not in dataset, "invalid dataset %s" % dataset
+        assert "@" not in snapshot, "invalid snapshot name %s" % snapshot
+        return VolumeSnapshot("%s@%s" % (dataset, snapshot))
+
+    @property
+    def snapshot(self) -> str:
+        return self.split("@")[1]
+
+    @property
+    def volume(self) -> "Volume":
+        return Volume(self.split("@")[0])
+
+
+class ZFSPoolConfig(TypedDict):
+    name: str
+    container: str
+    driver: str
+    revisions_to_keep: int
+    ephemeral_volatile: bool
+    snap_on_start_forensics: bool
+
+
+class ZFSPool(qubes.storage.Pool):
+    """ZFS thin storage for Qubes OS.
+
+    Volumes are stored as ZFS volumes, under a container dataset
+    specified by the *container* argument.  Here is the general
+    naming scheme for the volumes:
+
+        {vm_name}/{volume_name}
+
+    On VM startup,  volume contents are modified, depending on type,
+    according to the table below:
+
+    snap_on_start  save_on_stop    typical use
+
+    False          False           volatile
+        upon domain start:
+            the volume is recursively destroyed and recreated
+            to its specifications
+        upon domain stop:
+            the volume is removed completely
+
+    False          True            private / full persistence
+        upon create:
+            the volume is created according to specifications;
+            it may later be used as an import target or a clone
+            source
+        upon domain start:
+            the volume is used as-is; but flagged dirty
+        upon domain stop:
+            the volume is kept untouched; a revision snapshot
+            is created after stopping the qube, and all aged
+            snapshots are deleted; then it is flagged clean
+
+    True           False           root / volatile
+        upon domain start:
+            the volume is recursively destroyed and recreated,
+            cloning it from the last committed state of the
+            corresponding source volume, and then applying
+            the volume's storage specifications (size)
+        upon domain stop:
+            if snap on start forensics is enabled:
+                the volume is kept; the next start it
+                will be blown-away and recreated
+            if snap on start forensics is disabled:
+                the volume will be blown-away
+
+    True           True            unsupported
+
+    The term snap_on_start is deceptive in the ZFS world.  What it
+    means in the context of this driver is simply "clone on start",
+    when expressed in ZFS terminology.
+
+    The format of the revision name is `qubes:{cause}:{timestamp}`,
+    corresponding to a volume snapshot name of `@qubes:{cause}:{timestamp}`,
+    where `timestamp` is in '%s.s' format (seconds / milliseconds
+    since unix epoch),
+
+    Options exclusive to the ZFS driver:
+
+    * `container` (mandatory string): dataset path to use for the
+      ZFS Qubes pool objects.  This driver will both create the
+      dataset and, upon `destroy()`, destroy the dataset and all
+      descendants too.
+    * `snap_on_start_forensics` (default `False`): when `True`,
+      `snap_on_start` volumes (generally the root volume of every
+      AppVM) in this pool are kept after the machines using them
+      are powered off.  Useful to detect compromises in VMs after
+      the fact, as well as to perform general analysis of what's
+      being written to AppVM's root volumes.  Increases disk space
+      usage of the pool as the root volumes do not get cleaned up
+      until next VM start.
+    """
+
+    driver = "zfs"
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        revisions_to_keep: int = 1,
+        container: str,
+        ephemeral_volatile: bool = False,
+        snap_on_start_forensics: bool = False,
+    ):
+        super().__init__(  # type: ignore
+            name=name,
+            revisions_to_keep=revisions_to_keep,
+            ephemeral_volatile=ephemeral_volatile,
+        )
+        self.container = container
+        # Intify.
+        self.revisions_to_keep = int(self.revisions_to_keep)
+        # Boolify.
+        self.ephemeral_volatile = boolify(self.ephemeral_volatile)
+        self.snap_on_start_forensics = boolify(snap_on_start_forensics)
+        self._volume_objects_cache: Dict[Vid, ZFSVolume] = {}
+        self.log = logging.getLogger("%s" % (self.name,))
+        self.accessor: ZFSAccessor = ZFSAccessor(self.container)
+
+    def __repr__(self) -> str:
+        return "<{} at {:#x} name={!r} container={!r}>".format(
+            type(self).__name__, id(self), self.name, self.container
+        )
+
+    @property
+    def config(self) -> ZFSPoolConfig:
+        return ZFSPoolConfig(
+            {
+                "name": self.name,
+                "container": self.container,
+                "driver": self.driver,
+                "revisions_to_keep": self.revisions_to_keep,
+                "ephemeral_volatile": self.ephemeral_volatile,
+                "snap_on_start_forensics": self.snap_on_start_forensics,
+            }
+        )
+
+    async def destroy(self) -> None:
+        """
+        Destroy this pool.
+
+        In the current implementation we ignore this request.
+
+        A full implementation would simply zfs destroy recursively.
+        """
+        try:
+            await zfs_async(
+                "list",
+                self.container,
+                log=self.log,
+            )
+        except qubes.storage.StoragePoolException:
+            # Pool container does not exist anymore.
+            return
+        self.log.info("Deleting container dataset %s", self.container)
+        await zfs_async(
+            "destroy",
+            "-r",
+            self.container,
+            log=self.log,
+        )
+
+    def init_volume(
+        self,
+        vm: qubes.vm.qubesvm.QubesVM,
+        volume_config: Dict[str, Any],
+    ) -> "ZFSVolume":
+        """
+        Initialize a :py:class:`qubes.storage.Volume` from `volume_config`.
+        """
+        c = volume_config
+
+        if "vid" not in c:
+            if vm and hasattr(vm, "name"):
+                vm_name = str(vm.name)
+            else:
+                # for the future if we have volumes not belonging to a vm
+                vm_name = qubes.utils.random_string()  # type:ignore
+
+            vid = Vid.make(self.container, vm_name, volume_config["name"])
+        else:
+            vid = Vid(c["vid"])
+
+        revisions_to_keep = (
+            self.revisions_to_keep
+            if "revisions_to_keep" not in c
+            else c["revisions_to_keep"]
+        )
+
+        volume = ZFSVolume(
+            c["name"],
+            self,
+            vid,
+            revisions_to_keep,
+            c.get("rw", False),
+            c.get("save_on_stop", False),
+            c.get("size", 0),
+            c.get("snap_on_start", False),
+            c.get("source", None),
+            c.get("ephemeral"),
+            c.get("snap_on_start_forensics", False),
+        )
+        self._volume_objects_cache[vid] = volume
+        return volume
+
+    async def __init_container(self) -> None:
+        try:
+            await zfs_async(
+                "list",
+                self.container,
+                log=self.log,
+            )
+        except qubes.storage.StoragePoolException:
+            self.log.info("Creating container dataset %s", self.container)
+            await zfs_async(
+                "create",
+                "-o",
+                "mountpoint=none",
+                "-p",
+                self.container,
+                log=self.log,
+            )
+
+    async def setup(self) -> None:
+        # Trip here to prevent pool being added without ZFS.
+        check_zfs_available()
+        await self.__init_container()
+
+    def get_volume(self, vid: Vid) -> "ZFSVolume":
+        """Return a volume with given vid"""
+        if vid in self._volume_objects_cache:
+            return self._volume_objects_cache[vid]
+
+        # don't cache this object, as it doesn't carry full configuration
+        return ZFSVolume("unconfigured", self, vid)
+
+    def list_volumes(self) -> List["ZFSVolume"]:
+        """Return a list of volumes managed by this pool"""
+        return [v for v in self._volume_objects_cache.values()]
+
+    @property
+    def size(self) -> int:
+        """
+        Return size in bytes of the pool
+        """
+        return self.accessor.get_pool_size(log=self.log)
+
+    @property
+    def usage(self) -> int:
+        """
+        Return usage of pool in percent (0-100).
+
+        Synchronously refreshes the cache just like the LVM driver does.
+        """
+        usage = self.size - self.accessor.get_pool_available(log=self.log)
+        return int(usage / self.accessor.get_pool_size(log=self.log) * 100)
+
+    @property
+    def usage_details(self) -> Dict[str, int]:
+        """
+        Return usage details of pool.
+
+        Synchronously refreshes the cache.
+        """
+        result = {}
+        result["data_size"] = self.size
+        result["data_usage"] = self.usage
+        # I am not sure what metadata_size or metadata_usage
+        # are supposed to mean in the context of ZFS.
+        # ZFS does not provide such numbers.
+        # I will let the reviewers check that out.
+        metadata_size = 0
+        metadata_usage = 0
+        result["metadata_size"] = metadata_size
+        result["metadata_usage"] = metadata_usage
+        return result
+
+
+ZFSPropertyBag = TypedDict(
+    "ZFSPropertyBag",
+    {
+        "exists": bool,
+        "volsize": int,
+        "snapshots": List[VolumeSnapshot],
+        "readonly": bool,
+        "creation": int,
+        "org.qubes:dirty": bool,
+    },
+    total=False,
+)
+ZFSPropertyKeys = Literal[
+    "volsize",
+    "exists",
+    "snapshots",
+    "readonly",
+    "creation",
+    "org.qubes:dirty",
+]
+
+
+class ZFSPropertyCache(object):
+    """
+    A cache to speed up property query operations and other
+    expensive requests.
+
+    Callers must grab the self.lock available in their class
+    instance during a sequence of gets / sets / invalidates.
+    """
+
+    def __init__(self) -> None:
+        self.cache: Dict[Union[Volume, VolumeSnapshot], ZFSPropertyBag] = {}
+        self.lock = RLock()
+
+    def set(
+        self,
+        object: Union[Volume, VolumeSnapshot],
+        propname: ZFSPropertyKeys,
+        value: Any,
+    ) -> None:
+        """Set a cached value."""
+        # Grab lock before performing operation!
+        if object not in self.cache:
+            self.cache[object] = {}
+        propcache = self.cache[object]
+        propcache[propname] = value
+
+    def get(
+        self,
+        object: Union[Volume, VolumeSnapshot],
+        propname: ZFSPropertyKeys,
+    ) -> Any:
+        """Set a cached value.  Returns None if not in cache."""
+        # Grab lock before performing operation!
+        if object not in self.cache:
+            return None
+        if propname not in self.cache[object]:
+            return None
+        return self.cache[object][propname]
+
+    def invalidate(
+        self,
+        object: Union[Volume, VolumeSnapshot],
+        propname: Optional[ZFSPropertyKeys] = None,
+    ) -> None:
+        """Invalidate a cache value or all values for an object."""
+        # Grab lock before performing operation!
+        if object not in self.cache:
+            return
+        if propname is None:
+            del self.cache[object]
+        else:
+            if propname not in self.cache[object]:
+                return
+            del self.cache[object][propname]
+
+    def invalidate_recursively(
+        self,
+        object: Volume,
+        propname: Optional[ZFSPropertyKeys] = None,
+    ) -> None:
+        """Invalidate a value / all values for an object and descendants."""
+        # Grab lock before performing operation!
+        for f in list(self.cache):
+            if not dataset_in_root(f, object):
+                continue
+            if propname is None:
+                del self.cache[f]
+            elif propname in self.cache[f]:
+                del self.cache[f][propname]
+
+
+class ZFSAccessor(object):
+    """
+    Utility class to get / set / cache properties of datasets, as well
+    as modify pool members (primarily oriented to volumes and snapshots).
+    """
+
+    def __init__(self, root: str) -> None:
+        """
+        Initialize.
+
+        `root` is the root dataset against which all operations will be
+        validated.  If an operation is attempted outside the root,
+        an error is raised.
+        """
+        self.root = root
+        self.cache = ZFSPropertyCache()
+
+    async def _get_prop_table_async(
+        self,
+        volume: Union[Volume, VolumeSnapshot],
+        columns: List[str],
+        log: logging.Logger,
+    ) -> List[Dict[str, str]]:
+        text = await zfs_async(
+            "list",
+            "-Hp",
+            "-o",
+            ",".join(columns),
+            volume,
+            log=log,
+        )
+        result: List[Dict[str, str]] = []
+        for line in text.splitlines():
+            if not line.rstrip():
+                continue
+            fields = line.split("\n")
+            row: Dict[str, str] = {}
+            for k, v in zip(columns, fields):
+                row[k] = v
+            result.append(row)
+        return result
+
+    async def _get_prop_row_async(
+        self,
+        volume: Union[Volume, VolumeSnapshot],
+        columns: List[str],
+        log: logging.Logger,
+    ) -> Dict[str, str]:
+        res = await self._get_prop_table_async(volume, columns, log=log)
+        return res[0]
+
+    async def _get_prop_async(
+        self,
+        volume: Union[Volume, VolumeSnapshot],
+        propname: str,
+        log: logging.Logger,
+    ) -> str:
+        res = await self._get_prop_row_async(volume, [propname], log=log)
+        return res[propname]
+
+    def _get_prop_table(
+        self,
+        volume: Union[Volume, VolumeSnapshot],
+        columns: List[str],
+        log: logging.Logger,
+    ) -> List[Dict[str, str]]:
+        o = zfs("list", "-Hp", "-o", ",".join(columns), volume, log=log)
+        result: List[Dict[str, str]] = []
+        for line in o.splitlines():
+            if not line.rstrip():
+                continue
+            fields = line.split("\n")
+            row: Dict[str, str] = {}
+            for k, v in zip(columns, fields):
+                row[k] = v
+            result.append(row)
+        return result
+
+    def _get_prop_row(
+        self,
+        volume: Union[Volume, VolumeSnapshot],
+        columns: List[str],
+        log: logging.Logger,
+    ) -> Dict[str, str]:
+        res = self._get_prop_table(volume, columns, log)
+        return res[0]
+
+    def _get_prop(
+        self,
+        volume: Union[Volume, VolumeSnapshot],
+        propname: str,
+        log: logging.Logger,
+    ) -> str:
+        res = self._get_prop_row(volume, [propname], log)
+        return res[propname]
+
+    async def _set_prop(
+        self,
+        volume: Volume,
+        propname: str,
+        propval: str,
+        log: logging.Logger,
+    ) -> None:
+        await zfs_async("set", "%s=%s" % (propname, propval), volume, log=log)
+
+    async def volume_exists_async(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> bool:
+        """
+        Does volume exist?
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            cached = self.cache.get(volume, "exists")
+            if cached is not None:
+                return cast(bool, cached)
+            try:
+                await self._get_prop_async(volume, "name", log=log)
+                self.cache.set(volume, "exists", True)
+                return True
+            except qubes.storage.StoragePoolException:
+                pass
+            self.cache.set(volume, "exists", False)
+            return False
+
+    def volume_exists(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> bool:
+        """
+        Synchronous version of volume_exists_async.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            cached = self.cache.get(volume, "exists")
+            if cached is not None:
+                return cast(bool, cached)
+            try:
+                self._get_prop(volume, "name", log=log)
+                self.cache.set(volume, "exists", True)
+                return True
+            except qubes.storage.StoragePoolException:
+                pass
+            self.cache.set(volume, "exists", False)
+            return False
+
+    async def remove_volume_async(
+        self,
+        volume_or_snapshot: Union[Volume, VolumeSnapshot],
+        log: logging.Logger,
+    ) -> None:
+        """
+        Remove volume unconditionally, as well as all its children.
+
+        If a snapshot is passed instead, only the snapshot is removed.
+        """
+        volume = volume_or_snapshot.volume
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            cmd = ["destroy", "-r", volume_or_snapshot]
+            if isinstance(volume_or_snapshot, VolumeSnapshot):
+                # Deferred destroy as some snapshots may still be busy.
+                cmd.insert(1, "-d")
+            await zfs_async(*cmd, log=log)
+            if isinstance(volume_or_snapshot, VolumeSnapshot):
+                self.cache.invalidate(volume, "snapshots")
+            else:
+                self.cache.invalidate_recursively(volume)
+                self.cache.set(volume, "exists", False)
+
+    async def get_snapshot_clones_async(
+        self,
+        snapshot: VolumeSnapshot,
+        log: logging.Logger,
+    ) -> List[Volume]:
+        """
+        Get all volumes that are clones of this snapshot.
+
+        The snapshot must exist.
+
+        The return value is a list of `Volume`.
+
+        This property is not cached — figuring out cache invalidation for
+        this property has been postponed to a later cycle.  It is okay not
+        to cache this because this is used very rarely.
+        """
+        assert dataset_in_root(snapshot, self.root)
+        result = await self._get_prop_async(
+            snapshot,
+            "clones",
+            log=log,
+        )
+        if result == "-":
+            return []
+        return [Volume.make(s) for s in (result).split(",")]
+
+    async def remove_volume_async_with_retries(
+        self,
+        volume_or_snapshot: Union[Volume, VolumeSnapshot],
+        log: logging.Logger,
+    ) -> None:
+        async def _inner_remove_with_dependent_clone_retry() -> None:
+            try:
+                await self.remove_volume_async(
+                    volume_or_snapshot,
+                    log=log,
+                )
+            except DatasetHasDependentClones:
+                # The following code looks complicated.
+                # It really is not.
+                # Narration follows.
+                log.debug(
+                    "%s has dependents, checking them out",
+                    volume_or_snapshot,
+                )
+
+                already_promoted: Set[Volume] = set()
+                # Queue up a list of snapshots we must check to see
+                # if they have clones, so we can promote the clones.
+                if isinstance(volume_or_snapshot, VolumeSnapshot):
+                    # We already have our snapshot which we cannot delete.
+                    snapshots = [volume_or_snapshot]
+                else:
+                    # We must never promote the file system we are about
+                    # to blast from outer space.
+                    already_promoted.add(volume_or_snapshot)
+                    # List all the snapshots in the volume.
+                    snapshots = await self.get_volume_snapshots_async(
+                        volume_or_snapshot,
+                        log=log,
+                    )
+
+                for snapshot in snapshots:
+                    # For each snapshot, we're going to get all the clones
+                    # made out of it.  The intention is to assign the snapshot
+                    # to the first clone, so that then the prior owner can
+                    # be deleted (if that's what is being requested).
+                    clones = await self.get_snapshot_clones_async(
+                        snapshot,
+                        log=log,
+                    )
+                    for clone in clones:
+                        if clone in already_promoted:
+                            # Never promote something twice.  It is an error.
+                            continue
+
+                        # We will now promote this clone.  This will make the
+                        # snapshot "owned" by the clone, renaming the snapshot
+                        # accordingly.
+                        log.debug(
+                            "Promoting %s so we can free up %s for removal",
+                            clone,
+                            snapshot,
+                        )
+                        await zfs_async("promote", clone, log=log)
+                        self.cache.invalidate(clone, "snapshots")
+                        self.cache.invalidate(snapshot.volume, "snapshots")
+                        # Remember that we promoted this clone now, so we
+                        # do not attempt to promote it again.
+                        already_promoted.add(clone)
+                        # Only promote the first.  We do not need to promote
+                        # other clones because it is sufficient to promote one
+                        # clone in order for it to "own" the snapshot.
+                        break
+
+                if isinstance(volume_or_snapshot, Volume):
+                    # Retry the removal now.
+                    await self.remove_volume_async(
+                        volume_or_snapshot,
+                        log=log,
+                    )
+                    # There is no else clause for VolumeSnapshot because
+                    # once a snapshot's clone has been promoted, then
+                    # the snapshot is renamed to be "nested under" the
+                    # clone, effectively "removing" the snapshot as far
+                    # as the caller is concerned.
+
+        with self.cache.lock:
+            # Retry up to 20 times if the dataset is busy.
+            # Sometimes users of the volume return before the
+            # kernel has actually closed the device file.  We must
+            # wait until all users of the device file have closed it.
+            await retry_async(
+                lambda: _inner_remove_with_dependent_clone_retry(),
+                DatasetBusy,
+                20,
+                0.25,
+            )
+
+    async def clone_snapshot_to_volume_async(
+        self,
+        source: VolumeSnapshot,
+        dest: Volume,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Atomically clones a snapshot to a new volume.
+
+        The destination must not exist.
+
+        When this function returns, the block device associated
+        with the new volume is confirmed to exist.
+        """
+        assert dataset_in_root(dest, self.root)
+        with self.cache.lock:
+            await zfs_async("clone", "-p", source, dest, log=log)
+            self.cache.invalidate_recursively(dest)
+            devpath = os.path.join(ZVOL_DIR, dest)
+            await wait_for_device_async(devpath)
+
+    async def rename_volume_async(
+        self,
+        source: Volume,
+        dest: Volume,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Atomically renames a volume to a new name.
+
+        The new name must not exist.
+
+        When this function returns, the block device associated
+        with the new name is confirmed to exist.
+        """
+        assert dataset_in_root(dest, self.root)
+        with self.cache.lock:
+            await zfs_async("rename", source, dest, log=log)
+            self.cache.invalidate_recursively(source)
+            self.cache.invalidate_recursively(dest)
+            devpath = os.path.join(ZVOL_DIR, dest)
+            await wait_for_device_async(devpath)
+
+    async def create_volume_async(
+        self,
+        volume: Volume,
+        size: int,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Creates a volume.
+
+        The volume is created thin-provisioned.
+
+        The volume must not already exist.
+
+        When this function returns, the block device associated
+        with the newly-created volume is confirmed to exist.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            s = str(size)
+            await zfs_async("create", "-p", "-s", "-V", s, volume, log=log)
+            self.cache.invalidate_recursively(volume)
+            self.cache.set(volume, "exists", True)
+            self.cache.set(volume, "volsize", size)
+            devpath = os.path.join(ZVOL_DIR, volume)
+            await wait_for_device_async(devpath)
+
+    async def set_volume_readonly_async(
+        self,
+        volume: Volume,
+        readonly: bool,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Set a volume to read-only.  Prevents writes.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            self.cache.invalidate(volume, "readonly")
+            val = "on" if readonly else "off"
+            await self._set_prop(volume, "readonly", val, log)
+            self.cache.set(volume, "readonly", readonly)
+
+    async def resize_volume_async(
+        self,
+        volume: Volume,
+        size: int,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Enlarge a volume to the specified size.
+
+        The volume must exist.
+
+        An error will be raised if size is < current size.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            self.cache.invalidate(volume, "volsize")
+            await self._set_prop(volume, "volsize", str(size), log)
+            self.cache.set(volume, "volsize", size)
+
+    def get_volume_size(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> int:
+        """Get the current size of the volume."""
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            cached = self.cache.get(volume, "volsize")
+            if cached is not None:
+                return cast(int, cached)
+            ret = int(self._get_prop(volume, "volsize", log))
+            self.cache.set(volume, "volsize", ret)
+            return ret
+
+    async def set_volume_dirty_async(
+        self,
+        volume: Volume,
+        dirty: bool,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Mark the volume as dirty.
+
+        Usually used when a VM backed by this volume is started.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            self.cache.invalidate_recursively(volume, "org.qubes:dirty")
+            val = "on" if dirty else "off"
+            await self._set_prop(volume, "org.qubes:dirty", val, log)
+            self.cache.set(volume, "org.qubes:dirty", dirty)
+
+    def is_volume_dirty(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> bool:
+        """Get whether the volume is dirty or not."""
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            dirty = self.cache.get(volume, "org.qubes:dirty")
+            if dirty is not None:
+                return cast(bool, dirty)
+            v = self._get_prop(volume, "org.qubes:dirty", log)
+            ret = v == "on"
+            self.cache.set(volume, "org.qubes:dirty", ret)
+            return ret
+
+    async def is_volume_dirty_async(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> bool:
+        """Async version of `is_volume_dirty()`."""
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            dirty = self.cache.get(volume, "org.qubes:dirty")
+            if dirty is not None:
+                return cast(bool, dirty)
+            v = await self._get_prop_async(volume, "org.qubes:dirty", log)
+            ret = v == "on"
+            self.cache.set(volume, "org.qubes:dirty", ret)
+            return ret
+
+    def get_volume_snapshots(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> List[VolumeSnapshot]:
+        """
+        Get all snapshots of the volume.
+
+        The volume must exist.
+
+        The return value is a list of `VolumeSnapshot`.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            snapshots = self.cache.get(volume, "snapshots")
+            if snapshots is not None:
+                return cast(List[VolumeSnapshot], snapshots)
+            ret = [
+                VolumeSnapshot.make(s.split("@")[0], s.split("@")[1])
+                for s in zfs(
+                    "list",
+                    "-Hp",
+                    "-o",
+                    "name",
+                    "-t",
+                    "snapshot",
+                    volume,
+                    log=log,
+                ).splitlines()
+                if s.strip()
+            ]
+            self.cache.set(volume, "snapshots", ret)
+            return ret
+
+    async def get_volume_snapshots_async(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> List[VolumeSnapshot]:
+        """
+        Asynchronous version of `get_volume_snapshots()`.
+        """
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            snapshots = self.cache.get(volume, "snapshots")
+            if snapshots is not None:
+                return cast(List[VolumeSnapshot], snapshots)
+            ret = [
+                VolumeSnapshot.make(s.split("@")[0], s.split("@")[1])
+                for s in (
+                    await zfs_async(
+                        "list",
+                        "-Hp",
+                        "-o",
+                        "name",
+                        "-t",
+                        "snapshot",
+                        volume,
+                        log=log,
+                    )
+                ).splitlines()
+                if s.strip()
+            ]
+            self.cache.set(volume, "snapshots", ret)
+            return ret
+
+    async def snapshot_volume_async(
+        self,
+        vsnapshot: VolumeSnapshot,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Snapshot a volume.
+
+        The volume must exist.
+        """
+        assert dataset_in_root(vsnapshot.volume, self.root)
+        with self.cache.lock:
+            self.cache.invalidate(vsnapshot.volume, "snapshots")
+            await zfs_async(
+                "snapshot",
+                vsnapshot,
+                log=log,
+            )
+
+    async def rollback_to_snapshot_async(
+        self,
+        vsnapshot: VolumeSnapshot,
+        log: logging.Logger,
+    ) -> None:
+        """
+        Rollback a volume to a specific snapshot.
+
+        The volume must exist and contain the specified snapshot.
+
+        All more recent snapshots will be nuked.
+        """
+        assert dataset_in_root(vsnapshot.volume, self.root)
+        with self.cache.lock:
+            self.cache.invalidate(vsnapshot.volume)
+            await zfs_async(
+                "rollback",
+                "-r",
+                vsnapshot,
+                log=log,
+            )
+
+    def get_volume_usage(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> int:
+        """
+        Get the usage in bytes of the volume.
+
+        The returned value is the sum total of all volume-related
+        objects, including its snapshots.  If the volume and
+        all descendants (including clones) were destroyed, this
+        is the space that would be returned to the pool.
+        """
+        assert dataset_in_root(volume, self.root)
+        return int(
+            zfs(
+                "list",
+                "-Hp",
+                "-o",
+                "used",
+                volume,
+                log=log,
+            ).strip()
+        )
+
+    def get_volume_creation(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> int:
+        """Get volume creation time (as an UNIX timestamp)."""
+        assert dataset_in_root(volume, self.root)
+        with self.cache.lock:
+            creation = self.cache.get(volume, "creation")
+            if creation is not None:
+                return cast(int, creation)
+            ret = int(self._get_prop(volume, "creation", log=log))
+            self.cache.set(volume, "creation", ret)
+            return ret
+
+    def get_pool_available(
+        self,
+        log: logging.Logger,
+    ) -> int:
+        """Get available space in the pool, in bytes."""
+        return int(
+            zfs(
+                "zpool",
+                "list",
+                "-Hp",
+                "-o",
+                "free",
+                self.root.split("/")[0],
+                log=log,
+            ).strip()
+        )
+
+    def get_pool_size(
+        self,
+        log: logging.Logger,
+    ) -> int:
+        """Get total size of the pool, in bytes."""
+        return int(
+            zfs(
+                "zpool",
+                "list",
+                "-Hp",
+                "-o",
+                "size",
+                self.root.split("/")[0],
+                log=log,
+            ).strip()
+        )
+
+
+class ZFSVolume(qubes.storage.Volume):
+    """
+    ZFS thin volume implementation.
+    """
+
+    pool: ZFSPool
+
+    def __init__(
+        self,
+        name: str,
+        pool: ZFSPool,
+        vid: Vid,
+        revisions_to_keep: int = 1,
+        rw: bool = False,
+        save_on_stop: bool = False,
+        size: int = 0,
+        snap_on_start: bool = False,
+        source: Optional[qubes.storage.Volume] = None,
+        ephemeral: Optional[bool] = None,
+        snap_on_start_forensics: bool = False,
+        **kwargs: Dict[str, Any],
+    ) -> None:
+        """
+        Representation of a ZFS-backed volume.
+
+        Arguments:
+          name: used internally by Qubes
+          pool: ZFSPool object backing this volume
+          vid: volume identifier used internally by Qubes
+          revisions_to_keep: how many snapshots created by Qubes to keep
+          rw: whether the volume should be read/write or read-only
+          save_on_stop / snap_on_start: a variety of Qubes volume behaviors
+          source: if this volume has a source to clone from, then this variable
+                  will contain the `qubes.storage.Volume` source
+          ephemeral: internally used by Qubes to implement anti-forensic
+                     ephemerally encrypted block devices
+          snap_on_start_forensics: for snap_on_start volumes, if True, keep
+                                   the volumes around when the VM shuts off,
+                                   else clean them up
+        """
+        if snap_on_start and save_on_stop:
+            err = "ZFSVolume %s cannot be snap_on_start && save_on_stop" % vid
+            raise qubes.storage.StoragePoolException(err)
+        # Intify.
+        revisions_to_keep = int(revisions_to_keep)
+        if snap_on_start or save_on_stop:
+            # Non-volatile.  This type of dataset requires
+            # >= 1 # revisions to keep.
+            if revisions_to_keep < 1:
+                err = "ZFSVolume %s needs >= 1 revisions to keep" % vid
+                raise qubes.storage.StoragePoolException(err)
+        super().__init__(  # type: ignore
+            name=name,
+            pool=pool,
+            vid=vid,
+            revisions_to_keep=revisions_to_keep,
+            rw=rw,
+            save_on_stop=save_on_stop,
+            size=size,
+            snap_on_start=snap_on_start,
+            source=source,
+            ephemeral=ephemeral,
+            **kwargs,
+        )
+        self.snap_on_start_forensics = snap_on_start_forensics
+        self.vid = vid
+        self.log = logging.getLogger("%s" % (self.vid,))
+        if kwargs:
+            self.log.warning("Unsupported arguments received: %s", kwargs)
+
+    @property
+    def volume(self) -> Volume:
+        """Return the Volume object for this ZFSVolume."""
+        return Volume(self.vid)
+
+    @property
+    def revisions(self) -> Dict[str, str]:
+        """
+        Return a dictionary of revisions.
+
+        While the type says `[str, str]`, the specific format of the returned
+        revisions is as follows:
+        * key is in the revision name format `qubes:{cause}:{timestamp}` and
+          is the name of the snapshot that ZFS stores for this revision
+        * value is an ISO date string referring to when the revision was
+          created
+
+        Revisions marked for deferred destruction are also listed.
+        The user may revert a volume to such revisions until the moment
+        that the dependent cloned dataset is destroyed, at which point in
+        time the revision will disappear and will no longer be usable as a
+        revert point.  This behavior was tested manually.
+        """
+        if not self.pool.accessor.volume_exists(self.volume, self.log):
+            # No snapshots, volume does not exist yet.
+            return {}
+        snapshots = self.pool.accessor.get_volume_snapshots(
+            self.volume,
+            log=self.log,
+        )
+        revisions: Dict[str, str] = {}
+        for snapshot in snapshots:
+            if is_revision_dataset(snapshot):
+                timestamp = timestamp_from_revision(snapshot)
+                revisions[snapshot.snapshot] = qubes.storage.isodate(
+                    timestamp,
+                )  # type: ignore
+        return revisions
+
+    async def _purge_old_revisions(self) -> None:
+        """
+        Deletes all revisions except the `revisions_to_keep` latest ones.
+
+        May not actually delete all the revisions scheduled for deletion!
+        Any revision being used as the basis for a snap-on-start volume
+        currently in use simply may not be deleted, because the revision is
+        backing the volume in question.  Unlike reflink (where a deleted file
+        is absent from the VFS but continues to exist on-disk until all file
+        descriptors are closed), ZFS does not permit the removal of datasets
+        in active use, or snapshots backing datasets that exist.  However,
+        we do mark these snapshots for deferred destruction (defer_destroy),
+        so when the backing file system is finally gone, the snapshot will
+        be destroyed too.
+        """
+        self.log.debug("_purge_old_revisions %s", self.volume)
+        revisions = self.revisions
+        if not revisions:
+            return
+        revs = list(
+            reversed(
+                sorted(
+                    revisions.items(),
+                    key=lambda m: m[1],
+                )
+            )
+        )
+        r = self.revisions_to_keep
+        for snapshot, _ in revs[r:]:
+            await self.pool.accessor.remove_volume_async(
+                VolumeSnapshot.make(self.vid, snapshot),
+                log=self.log,
+            )
+        return
+
+    @property  # type: ignore
+    def size(self) -> int:
+        """
+        Get the allocated size of this volume.
+
+        If the volume does not exist, it returns the presumptive size
+        allocation the volume would get upon creation, which is a
+        configuration value set at creation / resize time.
+        """
+        if not self.pool.accessor.volume_exists(self.volume, self.log):
+            return self._size
+        return self.pool.accessor.get_volume_size(
+            self.volume,
+            log=self.log,
+        )
+
+    @property
+    def usage(self) -> int:  # type: ignore
+        # For reviewers: it is unclear what the usage property of a volume
+        # actually means to the end user:
+        #
+        # * Is it the amount of bytes written by the VM's file system?
+        #   E.g the VM has written 1 MiB to its disk
+        #   -> usage = 1 MiB
+        #   This would be akin to the `logicalused` ZFS dataset property.
+        # * Is it the amount of bytes taken up by the volume on disk?
+        #   E.g. the VM wrote 1 MiB, but these were compressed to 4 KiB
+        #   -> usage = 4 KiB
+        #   This is what we show right now.
+        #
+        # The distinction is important because a ZFS volume 1 MiB in size
+        # can have up to 1 MiB written to it before -ENOSPC, but that does
+        # not mean the volume will occupy 1 MiB.  Due to compression, it may
+        # occupy substantially less.  Due to snapshots, the volume and its
+        # descendants may occupy substantially more (this is the current
+        # behavior -- to return bytes used by itself and all descendants).
+        # Ultimately in ZFS the "used" field only makes sense in the context
+        # of the pool-wide space usage.
+        #
+        # See zfsprops(7) for more info.
+        if not self.pool.accessor.volume_exists(self.volume, self.log):
+            return 0
+        return self.pool.accessor.get_volume_usage(
+            self.volume,
+            log=self.log,
+        )
+
+    async def _nuke_and_clone_from(self, source: qubes.storage.Volume) -> None:
+        """
+        Clones this volume from the source.
+
+        If a volume existed before calling this, its data will be lost.
+
+        Upon return, a bit-by-bit identical copy of the source exists
+        in this volume.  If the source volume is a `ZFSVolume`, then
+        the copy was performed using copy-on-write.
+        """
+        # FIXME use suffix in create empty or clone before destroying final
+        self.log.debug("Cloning into %s from %s", self.volume, source)
+        if isinstance(source, ZFSVolume):
+            # The source device is a ZFS one;
+            # simply find out what its latest qubes snapshot is,
+            # then clone it from there.
+            # FIXME: perhaps clone to a temp dataset
+            # before deleting the target dataset.
+            self.log.debug("Source is a ZFS volume")
+            latest_snap, _ = source.latest_revision
+            try:
+                await self.pool.accessor.remove_volume_async_with_retries(
+                    self.volume, log=self.log
+                )
+            except DatasetDoesNotExist:
+                pass
+            src = VolumeSnapshot.make(source.volume, latest_snap)
+            self.log.debug(
+                "Creating volume %s with cloning from %s",
+                self.volume,
+                src,
+            )
+            await self.pool.accessor.clone_snapshot_to_volume_async(
+                src,
+                self.volume,
+                log=self.log,
+            )
+        else:
+            # Source is not a ZFS one;
+            # create the dataset with the size of the
+            # source (or larger if requested by user)
+            # and dd the contents sparsely.
+            self.log.debug("Source is not a ZFS volume")
+            # FIXME optimize, if the volume exists but is smaller
+            # than the source, simply grow the volume instead of
+            # nuking it completely.
+            self.log.debug(
+                "Creating empty volume %s for cloning with size %s",
+                self.volume,
+                source.size,
+            )
+            await self._nuke_and_create_empty(source.size)
+            infile = await source.export()  # type:ignore
+            outfile = os.path.join(ZVOL_DIR, self.volume)
+            try:
+                self.log.debug(
+                    "Copying %s to %s",
+                    infile,
+                    outfile,
+                )
+                await dd(infile, outfile, self.log)
+            finally:
+                await source.export_end(infile)  # type:ignore
+
+    async def _nuke_and_create_empty(
+        self,
+        size: Optional[int] = None,
+        suffix: str = "",
+    ) -> None:
+        if size is None:
+            assert self.size
+        volume = self.volume
+        if suffix != "":
+            volume = volume.add_suffix(suffix)
+        try:
+            await self.pool.accessor.remove_volume_async_with_retries(
+                volume, log=self.log
+            )
+        except DatasetDoesNotExist:
+            pass
+        size = size if size is not None else self.size
+        self.log.debug(
+            "Creating empty volume %s with size %s",
+            self.volume,
+            size,
+        )
+        await self.pool.accessor.create_volume_async(
+            volume,
+            size,
+            log=self.log,
+        )
+
+    async def _remove_all_exported(self) -> None:
+        self.log.debug("_remove_all_exported %s", self.volume)
+        exported = Volume.make(
+            os.path.join(
+                self.pool.container,
+                EXPORTED,
+                self.vid.replace("/", "_"),
+            )
+        )
+        try:
+            await self.pool.accessor.remove_volume_async_with_retries(
+                exported, log=self.log
+            )
+        except DatasetDoesNotExist:
+            pass
+
+    async def _remove_volume_and_exports(self, suffix: str = "") -> "ZFSVolume":
+        self.log.debug("Removing %s with suffix %s", self.volume, suffix)
+        if suffix == "":
+            await self._remove_all_exported()
+
+        volume = self.volume
+        if suffix != "":
+            volume = volume.add_suffix(suffix)
+        try:
+            await self.pool.accessor.remove_volume_async_with_retries(
+                self.volume, log=self.log
+            )
+        except DatasetDoesNotExist:
+            pass
+        return self
+
+    async def _adopt(self, suffix: str) -> None:
+        self.log.debug("Adopting %s from suffix %s", self.volume, suffix)
+        await self._remove_volume_and_exports()
+        await self.pool.accessor.rename_volume_async(
+            self.volume.add_suffix(suffix),
+            self.volume,
+            log=self.log,
+        )
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def remove(self, suffix: str = "") -> "ZFSVolume":
+        # If the last volume of the VM is removed, then
+        # the parent dataset should be removed too.  FIXME.
+        return await self._remove_volume_and_exports(suffix=suffix)
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def create(self) -> "ZFSVolume":
+        self.log.debug(
+            "Creating %s save_on_stop %s snap_on_start %s",
+            self.volume,
+            self.save_on_stop,
+            self.snap_on_start,
+        )
+        snap_on_start, save_on_stop = (self.snap_on_start, self.save_on_stop)
+
+        if snap_on_start and save_on_stop:
+            assert 0, "snap_on_start && save_on_stop on %s" % self.volume
+
+        elif save_on_stop:
+            # Private / persistent.
+            # Save on stop cannot be True when snap on start
+            # is True.  This means that this branch can never
+            # be taken when snap on start is True.  Furthermore,
+            # init_volume() blows up if a source is set, but
+            # snap on start is False.  Ergo, self.source is
+            # always unset here, and we do not need to cover
+            # that case.
+            #
+            # This is silly tho!  Why can't I clone a save on stop
+            # volume this way too?  It would be equivalent to the
+            # import path, which the ZFS code is perfectly capable
+            # of doing in an optimized way.
+            if self.source:
+                assert 0, "self.source != None && save_on_stop == True"
+            self.log.debug(
+                "Creating %s empty",
+                self.volume,
+            )
+            await self._nuke_and_create_empty()
+            # Make initial clean snapshot so this volume can be cloned later.
+            await self._create_revision("after-create")
+
+        else:
+            self.log.debug(
+                "Deferring creation of %s (source %s)",
+                self.volume,
+                self.source,
+            )
+
+        return self
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def start(self) -> "ZFSVolume":
+        """Start the volume, ensuring it is available to use in VMs."""
+        # I have investigated what the other drivers do in this case for
+        # snap on start and save on stop.  In both cases, the volume is
+        # only acted upon if it is not dirty.  If it is dirty, the logic
+        # is completely stopped.
+        #
+        # We do not track dirty / not dirty for fully volatile volumes,
+        # we only track their existence.  If it exists, it's dirty and
+        # therefore already started, so don't touch it.
+        self.log.debug("Starting volume %s", self.volume)
+        snap_on_start, save_on_stop = (self.snap_on_start, self.save_on_stop)
+
+        if snap_on_start and save_on_stop:
+            assert 0, "snap_on_start && save_on_stop on %s" % self.volume
+
+        elif not snap_on_start and not save_on_stop:
+            # Volatile.  Dataset only created on start.
+            # God help me if the user specify a source volume here.
+            # That should never have happened.
+            if self.source:
+                assert 0, "not reached, volatiles should not have sources"
+            if not self.pool.accessor.volume_exists(
+                self.volume,
+                log=self.log,
+            ):
+                self.log.debug(
+                    "Creating volatile %s empty",
+                    self.volume,
+                )
+                await self._nuke_and_create_empty()
+
+        elif save_on_stop:
+            # Private / persistent.  Dataset already created.
+            # We snapshot prior to end of start() to allow for the ability
+            # to export / clone the volume cleanly while the VM is running.
+            # Therefore we can support the assumption that the latest snapshot
+            # is always the most up-to-date clean data source, and therefore
+            # is cleanly exportable.
+            if not await self.pool.accessor.is_volume_dirty_async(
+                self.volume,
+                log=self.log,
+            ):
+                self.log.debug("Dirtying up save on stop %s", self.volume)
+                await self.pool.accessor.set_volume_dirty_async(
+                    self.volume,
+                    True,
+                    log=self.log,
+                )
+
+        elif snap_on_start:
+            if not await self.pool.accessor.volume_exists_async(
+                self.volume,
+                log=self.log,
+            ) or not await self.pool.accessor.is_volume_dirty_async(
+                self.volume,
+                log=self.log,
+            ):
+                # Root / reset-on-start.  Clone or create from source.
+                if self.source:
+                    self.log.debug(
+                        "Cloning snap on start %s from %s",
+                        self.volume,
+                        self.source,
+                    )
+                    await self._nuke_and_clone_from(self.source)
+                else:
+                    self.log.debug(
+                        "Creating snap on start %s empty",
+                        self.volume,
+                    )
+                    await self._nuke_and_create_empty()
+                self.log.debug("Dirtying up snap on start %s", self.volume)
+                await self.pool.accessor.set_volume_dirty_async(
+                    self.volume,
+                    True,
+                    log=self.log,
+                )
+
+        # At the very end we set the read-only flag to what the
+        # user requested via configuration.  This is wonderful
+        # because it means the volume cannot be modified by anything
+        # at all, even if something downstream insists the drive
+        # be made read-write.
+        await self.pool.accessor.set_volume_readonly_async(
+            self.volume,
+            not self.rw,
+            log=self.log,
+        )
+        return self
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def stop(self) -> "ZFSVolume":
+        """
+        Stop the volume, making it clean for clones and such.
+
+        In reality, only save on stop volumes are snapshotted for cloning.
+        Snap on start volumes may be / may not be deleted, depending on
+        Qubes ZFS pool configuration.
+        """
+        self.log.debug("Stopping volume %s", self.volume)
+        snap_on_start, save_on_stop = (self.snap_on_start, self.save_on_stop)
+
+        if snap_on_start and save_on_stop:
+            assert 0, "snap_on_start && save_on_stop on %s" % self.volume
+
+        elif not snap_on_start and not save_on_stop:
+            # Volatile.  Delete if exists.  No sense in keeping this.
+            await self._remove_volume_and_exports()
+
+        elif save_on_stop:
+            # Private / persistent.  User data that must be persisted.
+            if await self.pool.accessor.volume_exists_async(
+                self.volume,
+                log=self.log,
+            ) and await self.pool.accessor.is_volume_dirty_async(
+                self.volume,
+                log=self.log,
+            ):
+                self.log.debug("Marking as clean save on stop %s", self.volume)
+                await self.pool.accessor.set_volume_dirty_async(
+                    self.volume,
+                    False,
+                    log=self.log,
+                )
+                # Make clean snapshot so this volume can be cloned later.
+                await self._create_revision("after-stop")
+
+        elif snap_on_start:
+            # Root / reset-on-start.
+            # Will be recreated on start() anyway.
+            if self.snap_on_start_forensics:
+                self.log.debug("Marking as clean snap_on_start %s", self.volume)
+                await self.pool.accessor.set_volume_dirty_async(
+                    self.volume,
+                    False,
+                    log=self.log,
+                )
+            else:
+                self.log.debug("Keeping around %s for forensics", self.volume)
+                await self._remove_volume_and_exports()
+
+        return self
+
+    async def export(self) -> str:
+        """Returns an object that can be `open()`."""
+        self.log.debug("Start of export of %s", self.volume)
+        if not self.save_on_stop:
+            raise NotImplementedError(
+                f"Cannot export {self.vid} — volumes where save_on_stop=False"
+                " do not feature snapshots to export from"
+            )
+        latest_snap, _ = self.latest_revision
+        exported = os.path.join(
+            self.pool.container,
+            EXPORTED,
+            self.vid.replace("/", "_"),
+            latest_snap,
+        )
+        await self.pool.accessor.clone_snapshot_to_volume_async(
+            VolumeSnapshot.make(self.volume, latest_snap),
+            Volume.make(exported),
+            log=self.log,
+        )
+        return os.path.join(ZVOL_DIR, exported)
+
+    async def export_end(self, exported_path: str) -> None:
+        """Removes the previous export."""
+        self.log.debug(
+            "End of export of %s to path %s",
+            self.volume,
+            exported_path,
+        )
+        snapname = os.path.basename(exported_path)
+        exported = os.path.join(
+            self.pool.container,
+            EXPORTED,
+            self.vid.replace("/", "_"),
+            snapname,
+        )
+        await self.pool.accessor.remove_volume_async_with_retries(
+            Volume.make(exported), log=self.log
+        )
+
+    def block_device(self) -> qubes.storage.BlockDevice:
+        """Return :py:class:`qubes.storage.BlockDevice` for serialization in
+        the libvirt XML template as <disk>.
+        """
+        return qubes.storage.BlockDevice(  # type: ignore
+            os.path.join(
+                ZVOL_DIR,
+                self.volume,
+            ),
+            self.name,
+            None,
+            self.rw,
+            self.domain,
+            self.devtype,
+        )
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def import_volume(
+        self,
+        src_volume: qubes.storage.Volume,
+    ) -> "ZFSVolume":
+        """
+        Import a volume from another one.
+
+        Calls `_nuke_and_clone_from()`.
+        """
+        self.log.debug(
+            "Importing volume %s from source %s",
+            self.volume,
+            src_volume,
+        )
+        if not src_volume.save_on_stop:
+            raise NotImplementedError(
+                f"Cannot import from {self.vid} — volumes where"
+                " save_on_stop=False cannot be exported for import"
+            )
+
+        if self.is_dirty():
+            raise qubes.storage.StoragePoolException(
+                f"Cannot import to dirty volume {self.volume} —"
+                " start and stop its owning qube to clean it up"
+            )
+        await self._nuke_and_clone_from(src_volume)
+        # Make clean snapshot so this volume can be cloned later.
+        await self._create_revision("after-import-volume")
+        return self
+
+    async def _create_revision(self, cause: str) -> None:
+        """Convenience function to create a snapshot timestamped now()."""
+        await self.pool.accessor.snapshot_volume_async(
+            VolumeSnapshot.make(
+                self.volume,
+                timestamp_to_revision(
+                    time.time(),
+                    cause,
+                ),
+            ),
+            log=self.log,
+        )
+        await self._purge_old_revisions()
+
+    def abort_if_import_in_progress(self) -> None:
+        """Abort if an import is in progress."""
+        if self.pool.accessor.volume_exists(
+            self.volume.add_suffix(IMPORT_DATA_SUFFIX),
+            log=self.log,
+        ):
+            raise qubes.storage.StoragePoolException(
+                "Import operation in progress on {}".format(self.volume)
+            )
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def import_data(self, size: int) -> str:
+        """
+        Return a path name that can be `open()`ed.
+
+        Callers generally write data to the object.
+        """
+        self.log.debug("Importing data of size %s into %s", size, self.volume)
+        if self.is_dirty():
+            raise qubes.storage.StoragePoolException(
+                "Cannot import data to dirty volume {} -"
+                " stop the qube using it first".format(self.volume)
+            )
+        self.abort_if_import_in_progress()  # FIXME
+        await self._nuke_and_create_empty(size, suffix=IMPORT_DATA_SUFFIX)
+        return os.path.join(ZVOL_DIR, self.volume + IMPORT_DATA_SUFFIX)
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def import_data_end(self, success: bool) -> None:
+        """Either commit imported data, or discard temporary volume"""
+        self.log.debug("End of importing data into %s", self.volume)
+        if success:
+            await self._adopt(suffix=IMPORT_DATA_SUFFIX)
+            # Make initial clean snapshot so this volume can be cloned later.
+            await self._create_revision("after-import-data")
+        else:
+            await self.remove(suffix=IMPORT_DATA_SUFFIX)
+
+    def is_dirty(self) -> bool:
+        """
+        Returns True if the volume is dirty (in use).
+
+        If the machine crashes, it is plausible that some volumes
+        may be dirty for an unspecified time until the VMs using
+        those volumes successfully start then stop.
+        """
+        if self.save_on_stop:
+            return self.pool.accessor.is_volume_dirty(
+                self.volume,
+                log=self.log,
+            )
+        return False
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def resize(self, size: int) -> None:
+        """
+        Expands volume.
+
+        Throws
+        :py:class:`qubst.storage.qubes.storage.StoragePoolException` if
+        given size is less than current_size.
+        """
+        # FIXME: there does not seem to be a pathway to, but there
+        # should be a pathway to, reducing the storage size of a
+        # volume, whether it be by having to stop the VM first and
+        # then making a non-atomic clone / partial copy / rename
+        # of a zvol.  It is annoying that ZFS prevents volumes from
+        # being reduced in size.
+        self.log.debug("Resizing %s to %s", self.volume, size)
+        mysize = self.size
+        if size == mysize:
+            return
+        if size < mysize:
+            raise qubes.storage.StoragePoolException(
+                "Shrinking of ZFS volume %s is not possible" % (self.volume,)
+            )
+        if await self.pool.accessor.volume_exists_async(
+            self.volume,
+            log=self.log,
+        ):
+            # If the volume does not exist, we don't need to resize it.
+            await self.pool.accessor.resize_volume_async(
+                self.volume,
+                size,
+                log=self.log,
+            )
+            # Save the size of the volume so it is persisted in the
+            # config, and the volume can be recreated at the configured
+            # size if it is ever wiped/recreated.
+            self._size = size
+
+    def is_outdated(self) -> bool:
+        """
+        Returns whether the volume is outdated.
+
+        Notes:
+
+        * Volumes without snap_on_start can never be outdated.
+        * Volumes without a source can never be outdated.
+        * Nonexistent volumes cannot be outdated.
+        * Otherwise, a volume is outdated if the snapshot it was cloned from,
+          is older than the source's latest snapshot.
+
+        In practical terms, a running VM's root file system is considered
+        outdated when its source (the template's root file system), has been
+        snapshotted anew, which in practice only happens when the template
+        VM has been shut down.
+        """
+        if not self.snap_on_start:
+            return False
+        if not self.source:
+            return False
+        if not self.pool.accessor.volume_exists(self.volume, self.log):
+            # Volumes that don't exist can't be outdated,
+            # since they will be created on demand.
+            return False
+        self.log.debug("is_outdated with snap_on_start true %s", self.volume)
+        if not isinstance(self.source, ZFSVolume):
+            raise qubes.storage.StoragePoolException(
+                "%s cannot be cloned by ZFSVolume",
+                self.source,
+            )
+
+        _, last_source_rev_isodate = self.source.latest_revision
+        this_volume_timestamp = self.pool.accessor.get_volume_creation(
+            self.volume,
+            log=self.log,
+        )
+        this_isodate = qubes.storage.isodate(
+            this_volume_timestamp,
+        )  # type: ignore
+        return bool(last_source_rev_isodate > this_isodate)
+
+    @property
+    def latest_revision(self) -> Tuple[str, str]:
+        """
+        Get the latest revision snapshot name and ISO date.
+
+        If no revisions exist, raise `qubes.storage.StoragePoolException`.
+
+        Invariant: the latest revision is always clean.  All the code to create
+        new volumes from other volmes and export existing volumes relies on
+        this invariant.  The user can screw this up by using low-level zfs
+        snapshot command that create snapshots named just right at the exact
+        wrong times (e.g. a VM is running), but we do not expect them to do so,
+        and if they do, it's their gun aimed at their feet — not ours.
+        """
+        revs = self.revisions
+        if not revs:
+            raise qubes.storage.StoragePoolException(
+                "No revisions in %s" % self.volume,
+            )
+        s = list(
+            sorted(
+                revs.items(),
+                key=lambda m: m[1],
+            )
+        )[-1]
+        return s
+
+    @qubes.storage.Volume.locked  # type: ignore
+    async def revert(self, revision: Optional[str] = None) -> "ZFSVolume":
+        """
+        Revert to a particular revision, or the most recent one
+        if `revision` is None.
+        """
+        self.log.debug("revert %s to %s", self.volume, revision)
+        if self.is_dirty():
+            raise qubes.storage.StoragePoolException(
+                "Cannot revert dirty volume {} -"
+                " stop the qube first".format(
+                    self.volume,
+                )
+            )
+        self.abort_if_import_in_progress()
+        snaps = self.revisions
+        if not snaps:
+            raise qubes.storage.StoragePoolException(
+                "Cannot revert volume %s with no revisions" % (self.volume,)
+            )
+        if revision is None:
+            snap, _ = self.latest_revision
+        else:
+            snap = revision
+        await self.pool.accessor.rollback_to_snapshot_async(
+            VolumeSnapshot.make(self.volume, snap),
+            log=self.log,
+        )
+        return self
+
+    async def verify(self) -> bool:
+        """Verifies the volume."""
+        self.log.debug("verify %s", self.volume)
+        if not self.snap_on_start and not self.save_on_stop:
+            # Volatile.   start() creates it.
+            return True
+        if self.snap_on_start and not self.save_on_stop:
+            # Root / reset-on-start.  start() creates it.
+            return True
+        if await self.pool.accessor.volume_exists_async(
+            self.volume,
+            log=self.log,
+        ):
+            return True
+        raise qubes.storage.StoragePoolException(
+            "volume {} missing".format(
+                self.volume,
+            )
+        )

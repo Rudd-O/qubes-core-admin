@@ -404,6 +404,7 @@ done
 %{python3_sitelib}/qubes/storage/kernels.py
 %{python3_sitelib}/qubes/storage/lvm.py
 %{python3_sitelib}/qubes/storage/callback.py
+%{python3_sitelib}/qubes/storage/zfs.py
 %doc /usr/share/doc/qubes/qubes_callback.json.example
 
 %dir %{python3_sitelib}/qubes/tools
@@ -458,6 +459,7 @@ done
 %{python3_sitelib}/qubes/tests/storage_kernels.py
 %{python3_sitelib}/qubes/tests/storage_lvm.py
 %{python3_sitelib}/qubes/tests/storage_callback.py
+%{python3_sitelib}/qubes/tests/storage_zfs.py
 %{python3_sitelib}/qubes/tests/tarwriter.py
 
 %dir %{python3_sitelib}/qubes/tests/vm
