@@ -4,10 +4,13 @@
 # pylint: disable=protected-access
 # pylint: disable=invalid-name
 
+import asyncio
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import qubes.storage as storage
@@ -127,7 +130,12 @@ def dump_zfs_filesystems(text: str = "") -> None:
     subprocess.call("zfs list -t all -o name,origin,used >&2", shell=True)
 
 
-class ZFSBase(qubes.tests.QubesTestCase):
+class AsyncLoopHolderMixin(qubes.tests.QubesTestCase):
+    def rc(self, future: Coroutine[Any, Any, Any]) -> Any:
+        return self.loop.run_until_complete(future)  # type:ignore
+
+
+class ZFSBase(AsyncLoopHolderMixin):
     pool_name = None
     container = None
     data_file = None
@@ -176,9 +184,6 @@ class ZFSBase(qubes.tests.QubesTestCase):
         if DUMP_POOL_AFTER_EACH_TEST:
             self.dump()
 
-    def rc(self, future: Coroutine[Any, Any, Any]) -> Any:
-        return self.loop.run_until_complete(future)  # type:ignore
-
     def dump(self, text: str = "") -> None:
         return dump_zfs_filesystems(text)
 
@@ -193,6 +198,66 @@ class ZFSBase(qubes.tests.QubesTestCase):
         except AssertionError:
             return
         assert 0, f"{dataset} exists when it should not"
+
+
+class TC_01_ZFSPool_solidstate(AsyncLoopHolderMixin):
+    def test_boolify(self):
+        self.assertEqual(zfs.boolify("on"), True)
+        self.assertEqual(zfs.boolify("False"), False)
+        with self.assertRaises(ValueError):
+            zfs.boolify("Neither truey nor falsey")
+
+    def test_fail_unless_exists_async(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nonexistent = os.path.join(tmpdir, "x")
+            with self.assertRaises(storage.StoragePoolException):
+                self.rc(zfs.fail_unless_exists_async(nonexistent))
+            with open(nonexistent, "w") as f:
+                f.write("now it exists")
+            self.rc(zfs.fail_unless_exists_async(nonexistent))
+
+    def test_wait_for_device_async(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nonexistent = os.path.join(tmpdir, "x")
+
+            async def waiter() -> None:
+                await zfs.wait_for_device_async(nonexistent)
+
+            async def creator() -> None:
+                await asyncio.sleep(0.25)
+                with open(nonexistent, "w") as f:
+                    f.write("now it exists")
+
+            self.rc(asyncio.gather(waiter(), creator()))
+
+    def test_dataset_in_root(self):
+        self.assertTrue(zfs.dataset_in_root("a/b", "a"))
+        self.assertTrue(zfs.dataset_in_root("a", "a"))
+        self.assertFalse(zfs.dataset_in_root("a", "a/b"))
+
+    def test_timestamp_to_revision(self):
+        self.assertEqual(
+            zfs.timestamp_to_revision(123, "abc"),
+            "qubes:abc:123.000000",
+        )
+        self.assertTrue(zfs.is_revision_dataset("qubes:cause:123"))
+        self.assertFalse(zfs.is_revision_dataset("qubes-cause-123"))
+
+    def test_dd(self):
+        log = logging.getLogger(__name__)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "in")
+            dst = os.path.join(tmpdir, "out")
+            with open(src, "w") as f:
+                f.write("now it exists")
+            with open(dst, "w") as f:
+                f.write("former content")
+            self.rc(zfs.duplicate_disk(src, dst, log))
+            with open(dst, "r") as f:
+                self.assertEqual(f.read(), "now it exists")
+            falsesrc = os.path.join(tmpdir, "unrelated")
+            with self.assertRaises(storage.StoragePoolException):
+                self.rc(zfs.duplicate_disk(falsesrc, dst, log))
 
 
 @skip_unless_zfs_available

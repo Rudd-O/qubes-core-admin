@@ -3,6 +3,7 @@ Driver for storing qube images in ZFS pool volumes.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import shlex
@@ -12,6 +13,7 @@ import time
 
 import qubes
 import qubes.storage
+import qubes.storage.file
 import qubes.utils
 
 from threading import RLock
@@ -43,13 +45,23 @@ def boolify(val: Any) -> bool:
     """Make input `val` into a bool."""
     if isinstance(val, bool):
         return bool(val)
-    return str(val) in [
+    if str(val) in [
         "1",
         "true",
         "on",
         "True",
         "enabled",
-    ]
+    ]:
+        return True
+    if str(val) in [
+        "0",
+        "false",
+        "off",
+        "False",
+        "disabled",
+    ]:
+        return False
+    raise ValueError(val)
 
 
 async def fail_unless_exists_async(path: str) -> None:
@@ -159,10 +171,10 @@ async def duplicate_disk(
         "of=" + outpath,
         "conv=sparse,nocreat",
         "status=progress",
-        "iflag=direct",
-        "oflag=direct",
         "bs=1M",
+        "oflag=dsync",
     ]
+
     if not os.access(outpath, os.W_OK) or not os.access(inpath, os.R_OK):
         thecmd = [_sudo] + thecmd
     log.debug("Invoked with arguments %r", thecmd)
@@ -213,6 +225,17 @@ class DatasetDoesNotExist(qubes.storage.StoragePoolException):
     """
 
 
+@contextlib.contextmanager
+def _enoent_is_spe():
+    try:
+        yield
+    except FileNotFoundError as exc:
+        # Oops.  No ZFS.  Raise the appropriate exception.
+        raise qubes.storage.StoragePoolException(
+            "ZFS is not available on this system",
+        ) from exc
+
+
 def zfs(
     *cmd: str,
     log: logging.Logger,
@@ -229,40 +252,89 @@ def zfs(
 
     This version is synchronous.
     """
-    environ = {"LC_ALL": "C.UTF-8", **os.environ}
+    thecmd, environ = _generate_zfs_command(cmd)
+    with _enoent_is_spe():
+        with open(os.devnull, "rb") as devnull:
+            p = subprocess.run(
+                thecmd,
+                stdin=devnull,
+                capture_output=True,
+                check=False,
+                close_fds=True,
+                env=environ,
+            )
+    return _process_zfs_output(
+        thecmd,
+        p.returncode,
+        p.stdout,
+        p.stderr,
+        log=log,
+    )
+
+
+async def zfs_async(
+    *cmd: str,
+    log: logging.Logger,
+) -> str:
+    """
+    Asynchronous version of `zfs()`.
+    """
+    thecmd, environ = _generate_zfs_command(cmd)
+
+    with _enoent_is_spe():
+        with open(os.devnull, "rb") as devnull:
+            p = await asyncio.create_subprocess_exec(
+                *thecmd,
+                stdin=devnull,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environ,
+                close_fds=True,
+            )
+    stdout, stderr = await p.communicate()
+    returncode = await p.wait()
+    return _process_zfs_output(
+        thecmd,
+        returncode,
+        stdout,
+        stderr,
+        log=log,
+    )
+
+
+def _generate_zfs_command(
+    cmd: Tuple[str, ...],
+) -> Tuple[List[str], Dict[str, str]]:
     if cmd and cmd[0] == "zpool":
         thecmd = [_zpool] + list(cmd)[1:]
     else:
         thecmd = [_zfs] + list(cmd)
     if os.getuid() != 0:
         thecmd = [_sudo] + thecmd
-    thecmd_shell = " ".join(shlex.quote(x) for x in thecmd)
-    try:
-        p = subprocess.Popen(
-            thecmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            env=environ,
-        )
-    except FileNotFoundError as exc:
-        # Oops.  No ZFS.  Raise the appropriate exception.
-        raise qubes.storage.StoragePoolException(
-            "ZFS is not available on this system",
-        ) from exc
-    stdout, stderr = p.communicate()
+    environ = {"LC_ALL": "C.UTF-8", **os.environ}
+    return thecmd, environ
+
+
+def _process_zfs_output(
+    cmd: List[str],
+    returncode: int,
+    stdout: bytes,
+    stderr: bytes,
+    log: logging.Logger,
+):
+    thecmd_shell = " ".join(shlex.quote(x) for x in cmd)
     err = "\n".join(line for line in stderr.decode().splitlines())
     if stdout:
         log.debug("%s -> %s", thecmd_shell, stdout.decode().rstrip())
     else:
         log.debug("%s -> (no output)", thecmd_shell)
-    if p.returncode == 0 and err:
+    if returncode == 0 and err:
         log.warning("%s succeeded but produced stderr: %s", thecmd_shell, err)
-    elif p.returncode != 0:
+    elif returncode != 0:
         log.debug(
             "%s failed with %s and produced stderr: %s",
             thecmd_shell,
-            p.returncode,
+            returncode,
             err,
         )
         if err.rstrip().endswith("dataset is busy"):
@@ -275,21 +347,6 @@ def zfs(
             raise DatasetDoesNotExist(err)
         raise qubes.storage.StoragePoolException(err)
     return stdout.decode()
-
-
-async def zfs_async(
-    *cmd: str,
-    log: logging.Logger,
-) -> str:
-    """
-    Asynchronous version of `zfs()`.
-    """
-
-    def synced() -> str:
-        return zfs(*cmd, log=log)
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, synced)
 
 
 class Vid(str):
@@ -456,11 +513,7 @@ class ZFSPool(qubes.storage.Pool):
 
     async def destroy(self) -> None:
         """
-        Destroy this pool.
-
-        In the current implementation we ignore this request.
-
-        A full implementation would simply zfs destroy recursively.
+        Destroy this pool.  The container will be gone after calling this.
         """
         try:
             await zfs_async(
@@ -574,26 +627,6 @@ class ZFSPool(qubes.storage.Pool):
         usage = self.size - self.accessor.get_pool_available(log=self.log)
         return int(usage / self.accessor.get_pool_size(log=self.log) * 100)
 
-    @property
-    def usage_details(self) -> Dict[str, int]:
-        """
-        Return usage details of pool.
-
-        Synchronously refreshes the cache.
-        """
-        result = {}
-        result["data_size"] = self.size
-        result["data_usage"] = self.usage
-        # I am not sure what metadata_size or metadata_usage
-        # are supposed to mean in the context of ZFS.
-        # ZFS does not provide such numbers.
-        # I will let the reviewers check that out.
-        metadata_size = 0
-        metadata_usage = 0
-        result["metadata_size"] = metadata_size
-        result["metadata_usage"] = metadata_usage
-        return result
-
 
 ZFSPropertyBag = TypedDict(
     "ZFSPropertyBag",
@@ -679,13 +712,13 @@ class ZFSPropertyCache:
     ) -> None:
         """Invalidate a value / all values for an object and descendants."""
         # Grab lock before performing operation!
-        for ds in list(self.cache):
-            if not dataset_in_root(ds, obj):
+        for dataset in list(self.cache):
+            if not dataset_in_root(dataset, obj):
                 continue
             if propname is None:
-                del self.cache[ds]
-            elif propname in self.cache[ds]:
-                del self.cache[ds][propname]
+                del self.cache[dataset]
+            elif propname in self.cache[dataset]:
+                del self.cache[dataset][propname]
 
 
 class ZFSAccessor:
@@ -1530,7 +1563,7 @@ class ZFSVolume(qubes.storage.Volume):
             log=self.log,
         )
 
-    async def _nuke_and_clone_from(self, source: qubes.storage.Volume) -> None:
+    async def _wipe_and_clone_from(self, source: qubes.storage.Volume) -> None:
         """
         Clones this volume from the source.
 
@@ -1581,8 +1614,18 @@ class ZFSVolume(qubes.storage.Volume):
                 self.volume,
                 source.size,
             )
-            await self._nuke_and_create_empty(source.size)
-            infile = await source.export()  # type:ignore
+            await self._wipe_and_create_empty(source.size)
+
+            if isinstance(source, qubes.storage.file.FileVolume):
+                # File volume export() does not actually return a coroutine.
+                # This isn't just a typing error.  The await() fails.
+                loop = asyncio.get_event_loop()
+                infile = await loop.run_in_executor(
+                    None,
+                    source.export,
+                )  # type:ignore
+            else:
+                infile = await source.export()  # type:ignore
             outfile = os.path.join(ZVOL_DIR, self.volume)
             try:
                 self.log.debug(
@@ -1594,7 +1637,7 @@ class ZFSVolume(qubes.storage.Volume):
             finally:
                 await source.export_end(infile)  # type:ignore
 
-    async def _nuke_and_create_empty(
+    async def _wipe_and_create_empty(
         self,
         size: Optional[int] = None,
         suffix: str = "",
@@ -1605,7 +1648,10 @@ class ZFSVolume(qubes.storage.Volume):
         if suffix != "":
             volume = volume.add_suffix(suffix)
         try:
-            await self.pool.accessor.remove_volume_retried_async(volume, log=self.log)
+            await self.pool.accessor.remove_volume_retried_async(
+                volume,
+                log=self.log,
+            )
         except DatasetDoesNotExist:
             pass
         size = size if size is not None else self.size
@@ -1630,7 +1676,10 @@ class ZFSVolume(qubes.storage.Volume):
             )
         )
         try:
-            await self.pool.accessor.remove_volume_retried_async(exported, log=self.log)
+            await self.pool.accessor.remove_volume_retried_async(
+                exported,
+                log=self.log,
+            )
         except DatasetDoesNotExist:
             pass
 
@@ -1698,7 +1747,7 @@ class ZFSVolume(qubes.storage.Volume):
                 "Creating %s empty",
                 self.volume,
             )
-            await self._nuke_and_create_empty()
+            await self._wipe_and_create_empty()
             # Make initial clean snapshot so this volume can be cloned later.
             await self._create_revision("after-create")
 
@@ -1732,8 +1781,7 @@ class ZFSVolume(qubes.storage.Volume):
             # Volatile.  Dataset only created on start.
             # God help me if the user specify a source volume here.
             # That should never have happened.
-            if self.source:
-                assert 0, "not reached, volatiles should not have sources"
+            assert not self.source, "volatiles should not have sources"
             if not self.pool.accessor.volume_exists(
                 self.volume,
                 log=self.log,
@@ -1742,7 +1790,7 @@ class ZFSVolume(qubes.storage.Volume):
                     "Creating volatile %s empty",
                     self.volume,
                 )
-                await self._nuke_and_create_empty()
+                await self._wipe_and_create_empty()
 
         elif save_on_stop:
             # Private / persistent.  Dataset already created.
@@ -1777,13 +1825,13 @@ class ZFSVolume(qubes.storage.Volume):
                         self.volume,
                         self.source,
                     )
-                    await self._nuke_and_clone_from(self.source)
+                    await self._wipe_and_clone_from(self.source)
                 else:
                     self.log.debug(
                         "Creating snap on start %s empty",
                         self.volume,
                     )
-                    await self._nuke_and_create_empty()
+                    await self._wipe_and_create_empty()
                 self.log.debug("Dirtying up snap on start %s", self.volume)
                 await self.pool.accessor.set_volume_dirty_async(
                     self.volume,
@@ -1844,14 +1892,16 @@ class ZFSVolume(qubes.storage.Volume):
             # Root / reset-on-start.
             # Will be recreated on start() anyway.
             if self.snap_on_start_forensics:
-                self.log.debug("Marking as clean snap_on_start %s", self.volume)
+                self.log.debug(
+                    "Marking as clean snap_on_start %s, keeping volume around",
+                    self.volume,
+                )
                 await self.pool.accessor.set_volume_dirty_async(
                     self.volume,
                     False,
                     log=self.log,
                 )
             else:
-                self.log.debug("Keeping around %s for forensics", self.volume)
                 await self._remove_volume_and_exports()
 
         return self
@@ -1920,7 +1970,7 @@ class ZFSVolume(qubes.storage.Volume):
         """
         Import a volume from another one.
 
-        Calls `_nuke_and_clone_from()`.
+        Calls `_wipe_and_clone_from()`.
         """
         self.log.debug(
             "Importing volume %s from source %s",
@@ -1938,7 +1988,7 @@ class ZFSVolume(qubes.storage.Volume):
                 f"Cannot import to dirty volume {self.volume} —"
                 " start and stop its owning qube to clean it up"
             )
-        await self._nuke_and_clone_from(src_volume)
+        await self._wipe_and_clone_from(src_volume)
         # Make clean snapshot so this volume can be cloned later.
         await self._create_revision("after-import-volume")
         return self
@@ -1981,7 +2031,7 @@ class ZFSVolume(qubes.storage.Volume):
                 " stop the qube using it first".format(self.volume)
             )
         self.abort_if_import_in_progress()  # FIXME
-        await self._nuke_and_create_empty(size, suffix=IMPORT_DATA_SUFFIX)
+        await self._wipe_and_create_empty(size, suffix=IMPORT_DATA_SUFFIX)
         return os.path.join(ZVOL_DIR, self.volume + IMPORT_DATA_SUFFIX)
 
     @qubes.storage.Volume.locked  # type: ignore
@@ -2131,10 +2181,9 @@ class ZFSVolume(qubes.storage.Volume):
             )
         self.abort_if_import_in_progress()
         snaps = self.revisions
+        norevs = "Cannot revert volume %s with no revisions" % self.volume
         if not snaps:
-            raise qubes.storage.StoragePoolException(
-                "Cannot revert volume %s with no revisions" % self.volume
-            )
+            raise qubes.storage.StoragePoolException(norevs)
         if revision is None:
             snap, _ = self.latest_revision
         else:
