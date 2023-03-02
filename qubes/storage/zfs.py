@@ -52,15 +52,15 @@ def boolify(val: Any) -> bool:
     ]
 
 
-async def fail_unless_exists_async(p: str) -> None:
-    if os.path.exists(p):
+async def fail_unless_exists_async(path: str) -> None:
+    if os.path.exists(path):
         return
-    s = f"Device path {p} never appeared"
-    raise qubes.storage.StoragePoolException(s)
+    err = f"Device path {path} never appeared"
+    raise qubes.storage.StoragePoolException(err)
 
 
 async def retry_async(
-    callable: Callable[[], Coroutine[None, None, Any]],
+    kallable: Callable[[], Coroutine[None, None, Any]],
     exception_class: Type[BaseException],
     times: int,
     sleep_between_tries: float,
@@ -68,7 +68,7 @@ async def retry_async(
     counter = times
     while True:
         try:
-            v = await callable()
+            v = await kallable()
             return v
         except exception_class:
             counter = counter - 1
@@ -141,7 +141,7 @@ def timestamp_from_revision(fsname: str) -> float:
     return float(fsname.split("@")[-1].split(":")[-1])
 
 
-async def dd(
+async def duplicate_disk(
     inpath: str,
     outpath: str,
     log: logging.Logger,
@@ -189,8 +189,6 @@ class DatasetBusy(qubes.storage.StoragePoolException):
       * fs mounted with open files (not the case for this driver)
     """
 
-    pass
-
 
 class DatasetHasDependentClones(qubes.storage.StoragePoolException):
     """
@@ -205,8 +203,6 @@ class DatasetHasDependentClones(qubes.storage.StoragePoolException):
     in question.
     """
 
-    pass
-
 
 class DatasetDoesNotExist(qubes.storage.StoragePoolException):
     """
@@ -215,8 +211,6 @@ class DatasetDoesNotExist(qubes.storage.StoragePoolException):
     Raised when an operation with a dataset fails because it cannot
     be found in the pool (e.g. it was deleted).
     """
-
-    pass
 
 
 def zfs(
@@ -300,13 +294,13 @@ async def zfs_async(
 
 class Vid(str):
     @classmethod
-    def make(klass, container: str, vm_name: str, volume_name: str) -> "Vid":
+    def make(cls, container: str, vm_name: str, volume_name: str) -> "Vid":
         return Vid("{!s}/{!s}/{!s}".format(container, vm_name, volume_name))
 
 
 class Volume(str):
     @classmethod
-    def make(klass, name: str) -> "Volume":
+    def make(cls, name: str) -> "Volume":
         assert "@" not in name
         return Volume(name)
 
@@ -320,7 +314,7 @@ class Volume(str):
 
 class VolumeSnapshot(str):
     @classmethod
-    def make(klass, dataset: str, snapshot: str) -> "VolumeSnapshot":
+    def make(cls, dataset: str, snapshot: str) -> "VolumeSnapshot":
         assert "@" not in dataset, "invalid dataset %s" % dataset
         assert "@" not in snapshot, "invalid snapshot name %s" % snapshot
         return VolumeSnapshot("%s@%s" % (dataset, snapshot))
@@ -493,9 +487,9 @@ class ZFSPool(qubes.storage.Pool):
         """
         Initialize a :py:class:`qubes.storage.Volume` from `volume_config`.
         """
-        c = volume_config
+        cfg = volume_config
 
-        if "vid" not in c:
+        if "vid" not in cfg:
             if vm and hasattr(vm, "name"):
                 vm_name = str(vm.name)
             else:
@@ -504,26 +498,26 @@ class ZFSPool(qubes.storage.Pool):
 
             vid = Vid.make(self.container, vm_name, volume_config["name"])
         else:
-            vid = Vid(c["vid"])
+            vid = Vid(cfg["vid"])
 
         revisions_to_keep = (
             self.revisions_to_keep
-            if "revisions_to_keep" not in c
-            else c["revisions_to_keep"]
+            if "revisions_to_keep" not in cfg
+            else cfg["revisions_to_keep"]
         )
 
         volume = ZFSVolume(
-            c["name"],
+            cfg["name"],
             self,
             vid,
             revisions_to_keep,
-            c.get("rw", False),
-            c.get("save_on_stop", False),
-            c.get("size", 0),
-            c.get("snap_on_start", False),
-            c.get("source", None),
-            c.get("ephemeral"),
-            c.get("snap_on_start_forensics", False),
+            cfg.get("rw", False),
+            cfg.get("save_on_stop", False),
+            cfg.get("size", 0),
+            cfg.get("snap_on_start", False),
+            cfg.get("source", None),
+            cfg.get("ephemeral"),
+            cfg.get("snap_on_start_forensics", False),
         )
         self._volume_objects_cache[vid] = volume
         return volume
@@ -561,7 +555,7 @@ class ZFSPool(qubes.storage.Pool):
 
     def list_volumes(self) -> List["ZFSVolume"]:
         """Return a list of volumes managed by this pool"""
-        return [v for v in self._volume_objects_cache.values()]
+        return list(self._volume_objects_cache.values())
 
     @property
     def size(self) -> int:
@@ -623,7 +617,7 @@ ZFSPropertyKeys = Literal[
 ]
 
 
-class ZFSPropertyCache(object):
+class ZFSPropertyCache:
     """
     A cache to speed up property query operations and other
     expensive requests.
@@ -638,63 +632,63 @@ class ZFSPropertyCache(object):
 
     def set(
         self,
-        object: Union[Volume, VolumeSnapshot],
+        obj: Union[Volume, VolumeSnapshot],
         propname: ZFSPropertyKeys,
         value: Any,
     ) -> None:
         """Set a cached value."""
         # Grab lock before performing operation!
-        if object not in self.cache:
-            self.cache[object] = {}
-        propcache = self.cache[object]
+        if obj not in self.cache:
+            self.cache[obj] = {}
+        propcache = self.cache[obj]
         propcache[propname] = value
 
     def get(
         self,
-        object: Union[Volume, VolumeSnapshot],
+        obj: Union[Volume, VolumeSnapshot],
         propname: ZFSPropertyKeys,
     ) -> Any:
         """Set a cached value.  Returns None if not in cache."""
         # Grab lock before performing operation!
-        if object not in self.cache:
+        if obj not in self.cache:
             return None
-        if propname not in self.cache[object]:
+        if propname not in self.cache[obj]:
             return None
-        return self.cache[object][propname]
+        return self.cache[obj][propname]
 
     def invalidate(
         self,
-        object: Union[Volume, VolumeSnapshot],
+        obj: Union[Volume, VolumeSnapshot],
         propname: Optional[ZFSPropertyKeys] = None,
     ) -> None:
         """Invalidate a cache value or all values for an object."""
         # Grab lock before performing operation!
-        if object not in self.cache:
+        if obj not in self.cache:
             return
         if propname is None:
-            del self.cache[object]
+            del self.cache[obj]
         else:
-            if propname not in self.cache[object]:
+            if propname not in self.cache[obj]:
                 return
-            del self.cache[object][propname]
+            del self.cache[obj][propname]
 
     def invalidate_recursively(
         self,
-        object: Volume,
+        obj: Volume,
         propname: Optional[ZFSPropertyKeys] = None,
     ) -> None:
         """Invalidate a value / all values for an object and descendants."""
         # Grab lock before performing operation!
-        for f in list(self.cache):
-            if not dataset_in_root(f, object):
+        for ds in list(self.cache):
+            if not dataset_in_root(ds, obj):
                 continue
             if propname is None:
-                del self.cache[f]
-            elif propname in self.cache[f]:
-                del self.cache[f][propname]
+                del self.cache[ds]
+            elif propname in self.cache[ds]:
+                del self.cache[ds][propname]
 
 
-class ZFSAccessor(object):
+class ZFSAccessor:
     """
     Utility class to get / set / cache properties of datasets, as well
     as modify pool members (primarily oriented to volumes and snapshots).
@@ -760,9 +754,9 @@ class ZFSAccessor(object):
         columns: List[str],
         log: logging.Logger,
     ) -> List[Dict[str, str]]:
-        o = zfs("list", "-Hp", "-o", ",".join(columns), volume, log=log)
+        out = zfs("list", "-Hp", "-o", ",".join(columns), volume, log=log)
         result: List[Dict[str, str]] = []
-        for line in o.splitlines():
+        for line in out.splitlines():
             if not line.rstrip():
                 continue
             fields = line.split("\n")
@@ -893,12 +887,12 @@ class ZFSAccessor(object):
             return []
         return [Volume.make(s) for s in (result).split(",")]
 
-    async def remove_volume_async_with_retries(
+    async def remove_volume_retried_async(
         self,
         volume_or_snapshot: Union[Volume, VolumeSnapshot],
         log: logging.Logger,
     ) -> None:
-        async def _inner_remove_with_dependent_clone_retry() -> None:
+        async def _remove_with_promote_async() -> None:
             try:
                 await self.remove_volume_async(
                     volume_or_snapshot,
@@ -980,7 +974,7 @@ class ZFSAccessor(object):
             # kernel has actually closed the device file.  We must
             # wait until all users of the device file have closed it.
             await retry_async(
-                lambda: _inner_remove_with_dependent_clone_retry(),
+                _remove_with_promote_async,
                 DatasetBusy,
                 20,
                 0.25,
@@ -1047,8 +1041,16 @@ class ZFSAccessor(object):
         """
         assert dataset_in_root(volume, self.root)
         with self.cache.lock:
-            s = str(size)
-            await zfs_async("create", "-p", "-s", "-V", s, volume, log=log)
+            sizestr = str(size)
+            await zfs_async(
+                "create",
+                "-p",
+                "-s",
+                "-V",
+                sizestr,
+                volume,
+                log=log,
+            )
             self.cache.invalidate_recursively(volume)
             self.cache.set(volume, "exists", True)
             self.cache.set(volume, "volsize", size)
@@ -1473,8 +1475,8 @@ class ZFSVolume(qubes.storage.Volume):
                 )
             )
         )
-        r = self.revisions_to_keep
-        for snapshot, _ in revs[r:]:
+        num = self.revisions_to_keep
+        for snapshot, _ in revs[num:]:
             await self.pool.accessor.remove_volume_async(
                 VolumeSnapshot.make(self.vid, snapshot),
                 log=self.log,
@@ -1549,7 +1551,7 @@ class ZFSVolume(qubes.storage.Volume):
             self.log.debug("Source is a ZFS volume")
             latest_snap, _ = source.latest_revision
             try:
-                await self.pool.accessor.remove_volume_async_with_retries(
+                await self.pool.accessor.remove_volume_retried_async(
                     self.volume, log=self.log
                 )
             except DatasetDoesNotExist:
@@ -1588,7 +1590,7 @@ class ZFSVolume(qubes.storage.Volume):
                     infile,
                     outfile,
                 )
-                await dd(infile, outfile, self.log)
+                await duplicate_disk(infile, outfile, self.log)
             finally:
                 await source.export_end(infile)  # type:ignore
 
@@ -1603,9 +1605,7 @@ class ZFSVolume(qubes.storage.Volume):
         if suffix != "":
             volume = volume.add_suffix(suffix)
         try:
-            await self.pool.accessor.remove_volume_async_with_retries(
-                volume, log=self.log
-            )
+            await self.pool.accessor.remove_volume_retried_async(volume, log=self.log)
         except DatasetDoesNotExist:
             pass
         size = size if size is not None else self.size
@@ -1630,9 +1630,7 @@ class ZFSVolume(qubes.storage.Volume):
             )
         )
         try:
-            await self.pool.accessor.remove_volume_async_with_retries(
-                exported, log=self.log
-            )
+            await self.pool.accessor.remove_volume_retried_async(exported, log=self.log)
         except DatasetDoesNotExist:
             pass
 
@@ -1645,7 +1643,7 @@ class ZFSVolume(qubes.storage.Volume):
         if suffix != "":
             volume = volume.add_suffix(suffix)
         try:
-            await self.pool.accessor.remove_volume_async_with_retries(
+            await self.pool.accessor.remove_volume_retried_async(
                 self.volume, log=self.log
             )
         except DatasetDoesNotExist:
@@ -1880,21 +1878,21 @@ class ZFSVolume(qubes.storage.Volume):
         )
         return os.path.join(ZVOL_DIR, exported)
 
-    async def export_end(self, exported_path: str) -> None:
+    async def export_end(self, path: str) -> None:
         """Removes the previous export."""
         self.log.debug(
             "End of export of %s to path %s",
             self.volume,
-            exported_path,
+            path,
         )
-        snapname = os.path.basename(exported_path)
+        snapname = os.path.basename(path)
         exported = os.path.join(
             self.pool.container,
             EXPORTED,
             self.vid.replace("/", "_"),
             snapname,
         )
-        await self.pool.accessor.remove_volume_async_with_retries(
+        await self.pool.accessor.remove_volume_retried_async(
             Volume.make(exported), log=self.log
         )
 
@@ -2078,8 +2076,7 @@ class ZFSVolume(qubes.storage.Volume):
         self.log.debug("is_outdated with snap_on_start true %s", self.volume)
         if not isinstance(self.source, ZFSVolume):
             raise qubes.storage.StoragePoolException(
-                "%s cannot be cloned by ZFSVolume",
-                self.source,
+                "%s cannot be cloned by ZFSVolume" % self.source
             )
 
         _, last_source_rev_isodate = self.source.latest_revision
@@ -2111,13 +2108,12 @@ class ZFSVolume(qubes.storage.Volume):
             raise qubes.storage.StoragePoolException(
                 "No revisions in %s" % self.volume,
             )
-        s = list(
+        return list(
             sorted(
                 revs.items(),
                 key=lambda m: m[1],
             )
         )[-1]
-        return s
 
     @qubes.storage.Volume.locked  # type: ignore
     async def revert(self, revision: Optional[str] = None) -> "ZFSVolume":
@@ -2137,7 +2133,7 @@ class ZFSVolume(qubes.storage.Volume):
         snaps = self.revisions
         if not snaps:
             raise qubes.storage.StoragePoolException(
-                "Cannot revert volume %s with no revisions" % (self.volume,)
+                "Cannot revert volume %s with no revisions" % self.volume
             )
         if revision is None:
             snap, _ = self.latest_revision
