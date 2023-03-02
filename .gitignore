@@ -10,3 +10,6 @@ htmlcov/
 *.o
 .*.swp
 *.msm
+*.tar.gz
+*.rpm
+build

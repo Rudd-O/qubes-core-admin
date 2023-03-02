@@ -2,6 +2,8 @@ RPMS_DIR=rpm/
 
 VERSION := $(file <version)
 
+PROGNAME := qubes-core-dom0
+
 DIST_DOM0 ?= fc32
 
 OS ?= Linux
@@ -134,6 +136,8 @@ FILESDIR ?= c:/program files/Invisible Things Lab/Qubes
 DOCDIR ?= c:/qubes/doc
 endif
 
+.PHONY: clean help rpms rpms-vm srpm dist rpms-dom0 install all msi
+
 help:
 	@echo "make rpms                  -- generate binary rpm packages"
 	@echo "make rpms-dom0             -- generate binary rpm packages for Dom0"
@@ -142,6 +146,28 @@ help:
 	@echo "make update-repo-unstable  -- same, but to -testing repo"
 	@echo "make update-repo-installer -- copy dom0 rpms to installer repo"
 	@echo "make clean                 -- cleanup"
+
+clean:
+	find -name '*~' -print0 | xargs -0 rm -fv
+	find -name '__pycache__' -print0 | xargs -0 rm -rf
+	rm -fv *.tar.gz *.rpm
+	rm -f rpm_spec/core-dom0.spec core-dom0.spec
+
+# This target does not generate a valid specfile -- it is good
+# only for test local RPM builds.  To generate a valid specfile,
+# and a valid RPM, use the Qubes builder system.
+rpm_spec/core-dom0.spec: rpm_spec/core-dom0.spec.in
+	sed 's/@VERSION@/'$(VERSION)'/' rpm_spec/core-dom0.spec.in > rpm_spec/core-dom0.spec
+	sed -i 's/@BACKEND_VMM@/xen/' rpm_spec/core-dom0.spec
+	sed -i 's/@CHANGELOG@//' rpm_spec/core-dom0.spec
+	echo "* Wed Apr 04 2007 Fake Changelogger  $(VERSION)" >> rpm_spec/core-dom0.spec
+	echo "- Fake changelog entry" >> rpm_spec/core-dom0.spec
+
+dist: rpm_spec/core-dom0.spec
+	excludefrom= ; test -f .gitignore && excludefrom=--exclude-from=.gitignore ; DIR=$(PROGNAME)-$(VERSION) && FILENAME=$$DIR.tar.gz && tar cvzf "$$FILENAME" --exclude="$$FILENAME" --exclude=.git --exclude=.gitignore $$excludefrom --transform="s|^|$$DIR/|" --show-transformed *
+
+srpm: dist
+	T=`mktemp -d` && rpmbuild --define "_topdir $$T" -ts $(PROGNAME)-$(VERSION).tar.gz || { rm -rf "$$T"; exit 1; } && mv "$$T"/SRPMS/* . || { rm -rf "$$T"; exit 1; } && rm -rf "$$T"
 
 rpms: rpms-dom0
 

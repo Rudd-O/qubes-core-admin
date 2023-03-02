@@ -22,12 +22,14 @@
 #
 #
 
+%define mybuildnumber %{?build_number}%{?!build_number:1}
+
 %define _dracutmoddir	/usr/lib/dracut/modules.d
 %define backend_vmm @BACKEND_VMM@
 
 Name:		qubes-core-dom0
 Version:	@VERSION@
-Release:	1%{dist}
+Release:	%{mybuildnumber}%{dist}
 Summary:	The Qubes core files (Dom0-side)
 
 Group:		Qubes
