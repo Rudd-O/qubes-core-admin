@@ -112,15 +112,15 @@ def setup_test_zfs_pool(pool_name: str) -> Tuple[str, str]:
 
     listres = call_no_output(["zpool", "list", pool_name])
     if listres == 0:
-        cmd = ["zpool", "destroy", "-f", pool_name]
+        cmd = ["sudo", "zpool", "destroy", "-f", pool_name]
         subprocess.check_call(cmd)
-    cmd = ["zpool", "create", "-f", pool_name, data_file]
+    cmd = ["sudo", "zpool", "create", "-f", pool_name, data_file]
     subprocess.check_call(cmd)
     return data_file, container
 
 
 def teardown_test_zfs_pool(data_file: str, pool_name: str) -> None:
-    cmd = ["zpool", "destroy", pool_name]
+    cmd = ["sudo", "zpool", "destroy", pool_name]
     subprocess.check_call(cmd)
     os.unlink(data_file)
 
@@ -157,6 +157,10 @@ class ZFSBase(AsyncLoopHolderMixin):
             cls.pool_name,
         )
         super().tearDownClass()
+
+    def writable(self, volume_path: str) -> str:
+        subprocess.check_call(["sudo", "chmod", "ugo+rw", volume_path])
+        return volume_path
 
     def setUp(self) -> None:
         super().setUp()  # type:ignore
@@ -206,6 +210,9 @@ class TC_01_ZFSPool_solidstate(AsyncLoopHolderMixin):
         self.assertEqual(zfs.boolify("False"), False)
         with self.assertRaises(ValueError):
             zfs.boolify("Neither truey nor falsey")
+
+    def test_random_string(self):
+        self.assertEqual(zfs.get_random_string(5, "a"), "aaaaa")
 
     def test_fail_unless_exists_async(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -308,11 +315,12 @@ class TC_10_ZFSPool(ZFSBase):
         volume = self.get_vol(ONEMEG_SAVE_ON_STOP)
         self.rc(volume.create())
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+        with open(self.writable(voldev), "w+") as v:
             v.write("test data")
         self.rc(volume.stop())
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "r") as v:
+        with open(self.writable(voldev), "r") as v:
             r = v.read(10)
         assert r.startswith("test data"), "volume did not persist data"
 
@@ -326,27 +334,28 @@ class TC_10_ZFSPool(ZFSBase):
         self.rc(volume.create())
 
         # Export volume to device.
-        volume_exported = self.rc(volume.export())
+        exported = self.rc(volume.export())
         # Write to the exported device.  This should NOT make it into the
         # volume data, as the exported device is independent of the volume.
-        with open(volume_exported, "w") as volume_file:
+        with open(self.writable(exported), "w") as volume_file:
             volume_file.write("test data")
         # Unexport the volume.
-        self.rc(volume.export_end(volume_exported))
+        self.rc(volume.export_end(exported))
 
         # Export volume to device again.
-        volume_exported = self.rc(volume.export())
+        exported = self.rc(volume.export())
         # Read from the exported device, verifying the data did not
         # make it into the volume.
-        with open(volume_exported) as volume_file:
+        with open(self.writable(exported)) as volume_file:
             data = volume_file.read(20)
         assert not data.startswith("test data")
         # Unexport the volume.
-        self.rc(volume.export_end(volume_exported))
+        self.rc(volume.export_end(exported))
 
         # Import the following (zero-length) data into the volume.
         import_path = self.rc(volume.import_data(volume.size))
-        with open(import_path, "w+") as volume_file:
+
+        with open(self.writable(import_path), "w+") as volume_file:
             volume_file.write("test data")
         self.rc(volume.import_data_end(True))
         self.assertFalse(
@@ -355,12 +364,12 @@ class TC_10_ZFSPool(ZFSBase):
         )
 
         # Export the volume again to check that the data was imported.
-        volume_exported = self.rc(volume.export())
-        with open(volume_exported) as volume_file:
+        exported = self.rc(volume.export())
+        with open(self.writable(exported)) as volume_file:
             data = volume_file.read(20)
         assert data.startswith("test data")
         # Unexport the volume.
-        self.rc(volume.export_end(volume_exported))
+        self.rc(volume.export_end(exported))
 
     def test_013_resize_saveonstop(self) -> None:
         """Test that a volume can be enlarged, but cannot be shrunk."""
@@ -379,9 +388,7 @@ class TC_10_ZFSPool(ZFSBase):
         # Fail at shrinking.
         self.assertRaises(
             storage.StoragePoolException,
-            lambda: self.rc(
-                volume.resize(1024 * 1024),
-            ),
+            lambda: self.rc(volume.resize(1024 * 1024)),
         )
 
     def test_014_snaponstart_forgets_data(self) -> None:
@@ -400,11 +407,13 @@ class TC_10_ZFSPool(ZFSBase):
         )
         self.rc(volume.create())
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+
+        with open(self.writable(voldev), "w+") as v:
             v.write("test data")
         self.rc(volume.stop())
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "r") as v:
+        with open(self.writable(voldev), "r") as v:
             r = v.read(10)
         assert not r.startswith("test data"), "volume persisted data"
 
@@ -415,7 +424,8 @@ class TC_10_ZFSPool(ZFSBase):
         volume = self.get_vol(ONEMEG_SAVE_ON_STOP, name="015")
         self.rc(volume.create())
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+        with open(self.writable(voldev), "w+") as v:
             v.write("0123456789abcdef" * 1024 * int(1024 / 16))
         self.rc(volume.stop())
         # The data usage will never equal 1 meg because ZFS
@@ -428,8 +438,11 @@ class TC_10_ZFSPool(ZFSBase):
         self.rc(volume.create())
         self.rc(volume.start())
 
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+        self.writable(voldev)
+
         def seekandwrite() -> None:
-            with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w") as v:
+            with open(voldev, "w") as v:
                 v.seek(1536 * 1024)  # seek past one meg
                 v.write("hells yeah")
 
@@ -457,14 +470,15 @@ class TC_10_ZFSPool(ZFSBase):
         snapshot_before_start, _ = volume.latest_revision
         # Start and write some data to it, then stop.
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+        with open(self.writable(voldev), "w+") as v:
             v.write("test data")
         self.rc(volume.stop())
         # Now revert.  Our volume should no longer contain what we
         # recently wrote to it.
         self.rc(volume.revert(snapshot_before_start))
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "r") as v:
+        with open(self.writable(voldev), "r") as v:
             r = v.read(10)
         assert not r.startswith("test data"), "volume did not revert"
         self.rc(volume.stop())
@@ -483,7 +497,8 @@ class TC_10_ZFSPool(ZFSBase):
         self.rc(volume.create())
         # Start and write some data to it, then stop.
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+        with open(self.writable(voldev), "w+") as v:
             v.write("test 018")
         self.rc(volume.stop())
 
@@ -499,7 +514,8 @@ class TC_10_ZFSPool(ZFSBase):
         # Check that we imported the very latest data from the
         # (clean after stop) volume.
         # Test prompted by Debu's observations.
-        with open(os.path.join(zfs.ZVOL_DIR, volume2.volume), "r") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume2.volume)
+        with open(self.writable(voldev), "r") as v:
             r = v.read(10)
         assert r.startswith("test 018"), "volume did not commit correctly"
         self.rc(volume2.stop())
@@ -518,7 +534,8 @@ class TC_10_ZFSPool(ZFSBase):
         self.rc(volume.create())
         # Start and write some data to it, then stop.
         self.rc(volume.start())
-        with open(os.path.join(zfs.ZVOL_DIR, volume.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
+        with open(self.writable(voldev), "w+") as v:
             v.write("test 019")
 
         # Let's clone volume2 from volume.
@@ -533,7 +550,8 @@ class TC_10_ZFSPool(ZFSBase):
         # Check that we imported the very latest data from the
         # (clean after stop) volume.
         # Test prompted by Debu's observations.
-        with open(os.path.join(zfs.ZVOL_DIR, volume2.volume), "r") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, volume2.volume)
+        with open(self.writable(voldev), "r") as v:
             r = v.read(10)
         assert not r.startswith("test 019"), "volume did not commit correctly"
         self.rc(volume2.stop())
@@ -572,7 +590,8 @@ class TC_10_ZFSPool(ZFSBase):
         )
         self.rc(target.create())
         self.rc(target.start())
-        with open(os.path.join(zfs.ZVOL_DIR, target.volume), "rb") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, target.volume)
+        with open(self.writable(voldev), "rb") as v:
             r = v.read(1)
         # Should be all zeroes, since it cloned from the empty
         # save on stop volume, recently created.
@@ -580,12 +599,14 @@ class TC_10_ZFSPool(ZFSBase):
 
         # Now let's write to the source volume, see how this goes.
         self.rc(source.start())
-        with open(os.path.join(zfs.ZVOL_DIR, source.volume), "w+") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, source.volume)
+        with open(self.writable(voldev), "w+") as v:
             v.write("test 020")
 
         # Should still be all zeroes, since the clone must have proceeded
         # from the clean snapshot of the now-dirty save on stop volume.
-        with open(os.path.join(zfs.ZVOL_DIR, target.volume), "rb") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, target.volume)
+        with open(self.writable(voldev), "rb") as v:
             r = v.read(1)
         self.assertEqual(r, b"\0")
 
@@ -598,7 +619,8 @@ class TC_10_ZFSPool(ZFSBase):
         # Now, since both the target and the source were stopped, and
         # therefore are clean, upon new start of the target, it should
         # have the data written to the source before stop.
-        with open(os.path.join(zfs.ZVOL_DIR, target.volume), "r") as v:
+        voldev = os.path.join(zfs.ZVOL_DIR, target.volume)
+        with open(self.writable(voldev), "r") as v:
             rstr = v.read(8)
         self.assertEqual(rstr, "test 020")
 
@@ -678,3 +700,19 @@ class TC_10_ZFSPool(ZFSBase):
 
         # Now check the dataset exists.
         self.assert_dataset_exists(cloned.volume)
+
+    def test_024_volume_names(self) -> None:
+        v = self.get_vol(ONEMEG_SAVE_ON_STOP, name="024")
+        join = os.path.join
+        self.assertEqual(
+            v.exported_volume_name(),
+            join(v.pool.container, ".exported", v.vid.replace("/", "_")),
+        )
+        self.assertEqual(
+            v.exported_volume_name("a"),
+            join(v.pool.container, ".exported", v.vid.replace("/", "_"), "a"),
+        )
+        self.assertEqual(
+            v.importing_volume_name,
+            join(v.pool.container, ".importing", v.vid.replace("/", "_")),
+        )
