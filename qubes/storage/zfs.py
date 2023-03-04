@@ -19,7 +19,6 @@ import qubes.storage.file
 import qubes.utils
 
 
-from threading import RLock
 from typing import (
     cast,
     Optional,
@@ -201,6 +200,23 @@ def check_zfs_available() -> None:
         raise qubes.storage.StoragePoolException(
             "ZFS is not available on this system",
         )
+
+
+class DummyLock(asyncio.Lock):
+    """
+    A dummy lock class.  Used in a function as a context manager when the
+    caller of the function a requests lock not grabbed to prevent
+    a recursive deadlock.
+    """
+
+    def locked(self) -> bool:
+        return False
+
+    async def acquire(self) -> Literal[True]:
+        return True
+
+    def release(self) -> None:
+        pass
 
 
 class DatasetBusy(qubes.storage.StoragePoolException):
@@ -573,7 +589,7 @@ class ZFSPool(qubes.storage.Pool):
             revisions_to_keep,
             cfg.get("rw", False),
             cfg.get("save_on_stop", False),
-            cfg.get("size", 0),
+            cfg["size"],
             cfg.get("snap_on_start", False),
             cfg.get("source", None),
             cfg.get("ephemeral"),
@@ -671,7 +687,7 @@ class ZFSPropertyCache:
 
     def __init__(self) -> None:
         self.cache: Dict[Union[Volume, VolumeSnapshot], ZFSPropertyBag] = {}
-        self.lock = RLock()
+        self.lock = asyncio.Lock()
 
     def set(
         self,
@@ -827,7 +843,7 @@ class ZFSAccessor:
         res = self._get_prop_row(volume, [propname], log)
         return res[propname]
 
-    async def _set_prop(
+    async def _set_prop_async(
         self,
         volume: Volume,
         propname: str,
@@ -845,7 +861,7 @@ class ZFSAccessor:
         Does volume exist?
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             cached = self.cache.get(volume, "exists")
             if cached is not None:
                 return cast(bool, cached)
@@ -865,25 +881,22 @@ class ZFSAccessor:
     ) -> bool:
         """
         Synchronous version of volume_exists_async.
+
+        The result of this method is never cached.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
-            cached = self.cache.get(volume, "exists")
-            if cached is not None:
-                return cast(bool, cached)
-            try:
-                self._get_prop(volume, "name", log=log)
-                self.cache.set(volume, "exists", True)
-                return True
-            except qubes.storage.StoragePoolException:
-                pass
-            self.cache.set(volume, "exists", False)
-            return False
+        try:
+            self._get_prop(volume, "name", log=log)
+            return True
+        except qubes.storage.StoragePoolException:
+            pass
+        return False
 
     async def remove_volume_async(
         self,
         volume_or_snapshot: Union[Volume, VolumeSnapshot],
         log: logging.Logger,
+        lock: bool = True,
     ) -> None:
         """
         Remove volume unconditionally, as well as all its children.
@@ -892,7 +905,7 @@ class ZFSAccessor:
         """
         volume = volume_or_snapshot.volume
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with (self.cache.lock if lock else DummyLock()):
             cmd = ["destroy", "-r", volume_or_snapshot]
             if isinstance(volume_or_snapshot, VolumeSnapshot):
                 # Deferred destroy as some snapshots may still be busy.
@@ -940,6 +953,7 @@ class ZFSAccessor:
                 await self.remove_volume_async(
                     volume_or_snapshot,
                     log=log,
+                    lock=False,
                 )
             except DatasetHasDependentClones:
                 # The following code looks complicated.
@@ -964,6 +978,7 @@ class ZFSAccessor:
                     snapshots = await self.get_volume_snapshots_async(
                         volume_or_snapshot,
                         log=log,
+                        lock=False,
                     )
 
                 for snapshot in snapshots:
@@ -1004,6 +1019,7 @@ class ZFSAccessor:
                     await self.remove_volume_async(
                         volume_or_snapshot,
                         log=log,
+                        lock=False,
                     )
                     # There is no else clause for VolumeSnapshot because
                     # once a snapshot's clone has been promoted, then
@@ -1011,7 +1027,7 @@ class ZFSAccessor:
                     # clone, effectively "removing" the snapshot as far
                     # as the caller is concerned.
 
-        with self.cache.lock:
+        async with self.cache.lock:
             # Retry up to 20 times if the dataset is busy.
             # Sometimes users of the volume return before the
             # kernel has actually closed the device file.  We must
@@ -1038,7 +1054,7 @@ class ZFSAccessor:
         with the new volume is confirmed to exist.
         """
         assert dataset_in_root(dest, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             await zfs_async("clone", "-p", source, dest, log=log)
             self.cache.invalidate_recursively(dest)
             devpath = os.path.join(ZVOL_DIR, dest)
@@ -1059,7 +1075,7 @@ class ZFSAccessor:
         with the new name is confirmed to exist.
         """
         assert dataset_in_root(dest, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             await zfs_async("rename", source, dest, log=log)
             self.cache.invalidate_recursively(source)
             self.cache.invalidate_recursively(dest)
@@ -1083,7 +1099,7 @@ class ZFSAccessor:
         with the newly-created volume is confirmed to exist.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             sizestr = str(size)
             await zfs_async(
                 "create",
@@ -1110,10 +1126,10 @@ class ZFSAccessor:
         Set a volume to read-only.  Prevents writes.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             self.cache.invalidate(volume, "readonly")
             val = "on" if readonly else "off"
-            await self._set_prop(volume, "readonly", val, log)
+            await self._set_prop_async(volume, "readonly", val, log)
             self.cache.set(volume, "readonly", readonly)
 
     async def resize_volume_async(
@@ -1130,9 +1146,9 @@ class ZFSAccessor:
         An error will be raised if size is < current size.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             self.cache.invalidate(volume, "volsize")
-            await self._set_prop(volume, "volsize", str(size), log)
+            await self._set_prop_async(volume, "volsize", str(size), log)
             self.cache.set(volume, "volsize", size)
 
     def get_volume_size(
@@ -1140,13 +1156,26 @@ class ZFSAccessor:
         volume: Volume,
         log: logging.Logger,
     ) -> int:
+        """
+        Get the current size of the volume.
+
+        The result of this method is not cached.
+        """
+        assert dataset_in_root(volume, self.root)
+        return int(self._get_prop(volume, "volsize", log))
+
+    async def get_volume_size_async(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> int:
         """Get the current size of the volume."""
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             cached = self.cache.get(volume, "volsize")
             if cached is not None:
                 return cast(int, cached)
-            ret = int(self._get_prop(volume, "volsize", log))
+            ret = int(await self._get_prop_async(volume, "volsize", log))
             self.cache.set(volume, "volsize", ret)
             return ret
 
@@ -1162,10 +1191,10 @@ class ZFSAccessor:
         Usually used when a VM backed by this volume is started.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             self.cache.invalidate_recursively(volume, "org.qubes:dirty")
             val = "on" if dirty else "off"
-            await self._set_prop(volume, "org.qubes:dirty", val, log)
+            await self._set_prop_async(volume, "org.qubes:dirty", val, log)
             self.cache.set(volume, "org.qubes:dirty", dirty)
 
     def is_volume_dirty(
@@ -1173,25 +1202,24 @@ class ZFSAccessor:
         volume: Volume,
         log: logging.Logger,
     ) -> bool:
-        """Get whether the volume is dirty or not."""
+        """Sync version of `is_volume_dirty()`.  Results not cached."""
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
-            dirty = self.cache.get(volume, "org.qubes:dirty")
-            if dirty is not None:
-                return cast(bool, dirty)
-            v = self._get_prop(volume, "org.qubes:dirty", log)
-            ret = v == "on"
-            self.cache.set(volume, "org.qubes:dirty", ret)
-            return ret
+        v = self._get_prop(volume, "org.qubes:dirty", log)
+        ret = v == "on"
+        return ret
 
     async def is_volume_dirty_async(
         self,
         volume: Volume,
         log: logging.Logger,
     ) -> bool:
-        """Async version of `is_volume_dirty()`."""
+        """
+        Returns true if the volume is dirty.
+
+        The volume must exist.
+        """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             dirty = self.cache.get(volume, "org.qubes:dirty")
             if dirty is not None:
                 return cast(bool, dirty)
@@ -1211,39 +1239,37 @@ class ZFSAccessor:
         The volume must exist.
 
         The return value is a list of `VolumeSnapshot`.
+
+        The result of this method is never cached.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
-            snapshots = self.cache.get(volume, "snapshots")
-            if snapshots is not None:
-                return cast(List[VolumeSnapshot], snapshots)
-            ret = [
-                VolumeSnapshot.make(s.split("@")[0], s.split("@")[1])
-                for s in zfs(
-                    "list",
-                    "-Hp",
-                    "-o",
-                    "name",
-                    "-t",
-                    "snapshot",
-                    volume,
-                    log=log,
-                ).splitlines()
-                if s.strip()
-            ]
-            self.cache.set(volume, "snapshots", ret)
-            return ret
+        ret = [
+            VolumeSnapshot.make(s.split("@")[0], s.split("@")[1])
+            for s in zfs(
+                "list", "-Hp", "-o", "name", "-t", "snapshot", volume, log=log
+            ).splitlines()
+            if s.strip()
+        ]
+        return ret
 
     async def get_volume_snapshots_async(
         self,
         volume: Volume,
         log: logging.Logger,
+        lock: bool = True,
     ) -> List[VolumeSnapshot]:
         """
-        Asynchronous version of `get_volume_snapshots()`.
+        Get all snapshots of the volume.
+
+        The volume must exist.
+
+        The return value is a list of `VolumeSnapshot`.
+
+        `lock` can be false if the calling function will grab
+        self.cache.lock.
         """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        async with (self.cache.lock if lock else DummyLock()):
             snapshots = self.cache.get(volume, "snapshots")
             if snapshots is not None:
                 return cast(List[VolumeSnapshot], snapshots)
@@ -1277,7 +1303,7 @@ class ZFSAccessor:
         The volume must exist.
         """
         assert dataset_in_root(vsnapshot.volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             self.cache.invalidate(vsnapshot.volume, "snapshots")
             await zfs_async(
                 "snapshot",
@@ -1298,7 +1324,7 @@ class ZFSAccessor:
         All more recent snapshots will be nuked.
         """
         assert dataset_in_root(vsnapshot.volume, self.root)
-        with self.cache.lock:
+        async with self.cache.lock:
             self.cache.invalidate(vsnapshot.volume)
             await zfs_async(
                 "rollback",
@@ -1337,13 +1363,29 @@ class ZFSAccessor:
         volume: Volume,
         log: logging.Logger,
     ) -> int:
-        """Get volume creation time (as an UNIX timestamp)."""
+        """
+        Sync version of get_volume_creation_async().
+
+        Results are never cached..
+        """
         assert dataset_in_root(volume, self.root)
-        with self.cache.lock:
+        ret = int(self._get_prop(volume, "creation", log=log))
+        return ret
+
+    async def get_volume_creation_async(
+        self,
+        volume: Volume,
+        log: logging.Logger,
+    ) -> int:
+        """
+        Get volume creation time (as an UNIX timestamp).
+        """
+        assert dataset_in_root(volume, self.root)
+        async with self.cache.lock:
             creation = self.cache.get(volume, "creation")
             if creation is not None:
                 return cast(int, creation)
-            ret = int(self._get_prop(volume, "creation", log=log))
+            ret = int(await self._get_prop_async(volume, "creation", log=log))
             self.cache.set(volume, "creation", ret)
             return ret
 
@@ -1620,10 +1662,8 @@ class ZFSVolume(qubes.storage.Volume):
         # grow the volume if needed, then wipe the volume by using
         # BLKDISCARD, so it returns zeroes before we return to
         # the caller.
-        if size is None:
-            assert self.size
         await self._remove_volume_if_exists()
-        size = size if size is not None else self.size
+        size = size if size is not None else self._size
         self.log.debug(
             "Creating empty volume %s with size %s",
             self.volume,
@@ -1819,7 +1859,7 @@ class ZFSVolume(qubes.storage.Volume):
             # God help me if the user specify a source volume here.
             # That should never have happened.
             assert not self.source, "volatiles should not have sources"
-            if not self.pool.accessor.volume_exists(
+            if not await self.pool.accessor.volume_exists_async(
                 self.volume,
                 log=self.log,
             ):
