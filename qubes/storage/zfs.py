@@ -409,7 +409,7 @@ class VolumeSnapshot(str):
 
     @property
     def volume(self) -> "Volume":
-        return Volume(self.split("@")[0])
+        return Volume(self.split("@", maxsplit=1)[0])
 
 
 class ZFSPoolConfig(TypedDict):
@@ -1581,7 +1581,7 @@ class ZFSVolume(qubes.storage.Volume):
         except DatasetDoesNotExist:
             pass
 
-    async def _remove_volume_and_exports_imports(self) -> "ZFSVolume":
+    async def _remove_volume_and_derived(self) -> "ZFSVolume":
         await self._remove_volume_import_if_exists()
         await self._remove_volume_export_if_exists()
         await self._remove_volume_if_exists()
@@ -1789,7 +1789,7 @@ class ZFSVolume(qubes.storage.Volume):
     async def remove(self) -> "ZFSVolume":
         # FIXME: if the last volume of the VM is removed, then
         # the parent dataset should be removed too.
-        ret = await self._remove_volume_and_exports_imports()
+        ret = await self._remove_volume_and_derived()
         self.pool.notify_volume_deleted(self)
         return ret
 
@@ -1949,7 +1949,7 @@ class ZFSVolume(qubes.storage.Volume):
 
         elif not snap_on_start and not save_on_stop:
             # Volatile.  Delete if exists.  No sense in keeping this.
-            await self._remove_volume_and_exports_imports()
+            await self._remove_volume_and_derived()
 
         elif save_on_stop:
             # Private / persistent.  User data that must be persisted.
@@ -1983,7 +1983,7 @@ class ZFSVolume(qubes.storage.Volume):
                     log=self.log,
                 )
             else:
-                await self._remove_volume_and_exports_imports()
+                await self._remove_volume_and_derived()
 
         return self
 
