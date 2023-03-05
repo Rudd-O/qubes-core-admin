@@ -11,11 +11,15 @@ checks:tests:
   - ci/codecov-wrapper -F unittests
   before_script:
   - sudo dnf install -y lvm2 vim-common python3-lxml python3-docutils
-  - sudo dnf install -y https://zfsonlinux.org/fedora/zfs-release-2-2$(rpm --eval "%{dist}").noarch.rpm
-  - sudo dnf install -y zfs
-  - sudo modprobe zfs
   - git clone https://github.com/QubesOS/qubes-core-qrexec ~/qubes-core-qrexec
   - pip3 install --user --quiet -r ci/requirements.txt
+  - |
+      set -e
+      echo Installing ZFS after the CI requirements so after_script codecov-wrapper does not explode if ZFS install fails.
+      sudo dnf install -y https://zfsonlinux.org/fedora/zfs-release-2-2$(rpm --eval "%{dist}").noarch.rpm
+      echo $(uname -r) is the running kernel
+      sudo dnf install -y zfs
+      sudo modprobe zfs
   script:
   - PYTHONPATH=test-packages:~/qubes-core-qrexec ./run-tests
   stage: checks
