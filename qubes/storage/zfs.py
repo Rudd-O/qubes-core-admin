@@ -39,7 +39,7 @@ ZVOL_DIR = "/dev/zvol"
 EXPORTED = ".exported"
 IMPORTING = ".importing"
 REVISION_PREFIX = "qubes"
-_sudo, _dd, _zfs, _zpool = "sudo", "dd", "zfs", "zpool"
+_sudo, _dd, _zfs, _zpool, _ionice = "sudo", "dd", "zfs", "zpool", "ionice"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -175,13 +175,17 @@ async def duplicate_disk(
     Raises `qubes.storage.StoragePoolException` if the copy fails.
     """
     thecmd = [
+        _ionice,
+        "-c3",
+        "--",
         _dd,
         "if=" + inpath,
         "of=" + outpath,
         "conv=sparse,nocreat",
         "status=progress",
-        "bs=1M",
-        "oflag=dsync",
+        "bs=64M",
+        "iflag=nocache",
+        "oflag=nocache,dsync",
     ]
 
     if not os.access(outpath, os.W_OK) or not os.access(inpath, os.R_OK):
