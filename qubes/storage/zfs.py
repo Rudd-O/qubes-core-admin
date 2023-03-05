@@ -613,8 +613,12 @@ class ZFSPool(qubes.storage.Pool):
             self.log.info("Creating container dataset %s", self.container)
             await zfs_async(
                 "create",
+                # Nothing below here shall be mounted by default.
                 "-o",
                 "mountpoint=none",
+                # No volumes shall have their partitions exposed in dom0.
+                "-o",
+                "volmode=dev",
                 "-p",
                 self.container,
                 log=self.log,
