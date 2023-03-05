@@ -76,7 +76,12 @@ Requires:       libvirt-python3
 
 Requires:       pciutils
 # ionice, for low-disk-impact dd during volume duplication.
+%if "x%{fc32}" == "x1"
+# FC32 / Q4.1 builds don't have util-linux-core.
 Requires:       util-linux
+%else
+Requires:       util-linux-core
+%endif
 # udev rules for encrypted volatile volumes
 Requires:       qubes-core-dom0-linux >= 4.1.13
 # policy (daemon) using changed qubesd socket protocol
