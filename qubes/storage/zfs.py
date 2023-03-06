@@ -1525,13 +1525,13 @@ class ZFSAccessor:
                 return cast(int, used)
             usage_by_dataset = self._get_prop_table(
                 Volume.make(self.root),
-                ["name", "used"],
+                ["name", "logicalreferenced"],
                 log,
                 True,
             )
             for dinfo in usage_by_dataset:
                 try:
-                    used = int(dinfo["used"])
+                    used = int(dinfo["logicalreferenced"])
                 except (TypeError, ValueError):
                     # Not an usage — maybe a dash.
                     continue

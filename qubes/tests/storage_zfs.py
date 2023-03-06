@@ -463,9 +463,8 @@ class TC_10_ZFSPool(ZFSBase):
         voldev = os.path.join(zfs.ZVOL_DIR, volume.volume)
         self.write(voldev, "0123456789abcdef" * 1024 * int(1024 / 16))
         self.rc(volume.stop())
-        # The data usage will never equal 1 meg because ZFS
-        # does RLE compression and other forms of compression too.
-        assert volume.usage > 0
+        # This should be close to what we want.
+        assert volume.usage > 1024 * 1024 - 25 * 1024, volume.usage
 
     def test_016_resize_saveonstop(self) -> None:
         """Test that a volume does in fact enlarge after start."""
