@@ -40,6 +40,15 @@ ZVOL_DIR = "/dev/zvol"
 EXPORTED = ".exported"
 IMPORTING = ".importing"
 REVISION_PREFIX = "qubes"
+
+# Sentinel value for auto-snapshot policy:
+# Do not let zfs-auto-snapshot create useless snapshots
+# for a volume that will be wiped anyway, and whose
+# source is likely either not snapshot-worthy, or
+# already auto-snapshotted by explicit sysadmin policy.
+NO_AUTO_SNAPSHOT = {"com.sun:auto-snapshot": "false"}
+DEF_AUTO_SNAPSHOT: Dict[str, str] = {}
+
 _sudo, _dd, _zfs, _zpool, _ionice = "sudo", "dd", "zfs", "zpool", "ionice"
 
 
@@ -1165,6 +1174,7 @@ class ZFSAccessor:
         self,
         source: VolumeSnapshot,
         dest: Volume,
+        dataset_options: Dict[str, str],
         log: logging.Logger,
     ) -> None:
         """
@@ -1172,12 +1182,18 @@ class ZFSAccessor:
 
         The destination must not exist.
 
+        `dataset_options` will be applied to the clone.
+
         When this function returns, the block device associated
         with the new volume is confirmed to exist.
         """
         assert dataset_in_root(dest, self.root)
         async with self.cache.async_lock:
-            await zfs_async("clone", "-p", source, dest, log=log)
+            cmd = ["clone", "-p"]
+            for optname, optval in dataset_options.items():
+                cmd += ["-o", f"{optname}={optval}"]
+            cmd += [source, dest]
+            await zfs_async(*cmd, log=log)
             self.cache.invalidate_recursively(dest)
             devpath = os.path.join(ZVOL_DIR, dest)
             await wait_for_device_async(devpath)
@@ -1208,6 +1224,7 @@ class ZFSAccessor:
         self,
         volume: Volume,
         size: int,
+        dataset_options: Dict[str, str],
         log: logging.Logger,
     ) -> None:
         """
@@ -1217,19 +1234,21 @@ class ZFSAccessor:
 
         The volume must not already exist.
 
+        `dataset_options` establishes the -o opt=val parameters
+        passed to the zfs create command.
+
         When this function returns, the block device associated
         with the newly-created volume is confirmed to exist.
         """
         assert dataset_in_root(volume, self.root)
         async with self.cache.async_lock:
             sizestr = str(size)
+            cmd = ["create", "-p", "-s", "-V", sizestr]
+            for optname, optval in dataset_options.items():
+                cmd += ["-o", f"{optname}={optval}"]
+            cmd += [volume]
             await zfs_async(
-                "create",
-                "-p",
-                "-s",
-                "-V",
-                sizestr,
-                volume,
+                *cmd,
                 log=log,
             )
             self.cache.invalidate_recursively(volume)
@@ -1659,6 +1678,9 @@ class ZFSVolume(qubes.storage.Volume):
         self.log = logging.getLogger("%s" % (self.vid,))
         if kwargs:
             self.log.warning("Unsupported arguments received: %s", kwargs)
+        self._auto_snapshot_policy = (
+            DEF_AUTO_SNAPSHOT if self.save_on_stop else NO_AUTO_SNAPSHOT
+        )
 
     async def _purge_old_revisions(self) -> None:
         """
@@ -1782,6 +1804,7 @@ class ZFSVolume(qubes.storage.Volume):
             await self.pool.accessor.clone_snapshot_to_volume_async(
                 src,
                 self.volume,
+                self._auto_snapshot_policy,
                 log=self.log,
             )
         else:
@@ -1798,7 +1821,9 @@ class ZFSVolume(qubes.storage.Volume):
                 self.volume,
                 source.size,
             )
-            await self._wipe_and_create_empty(source.size)
+            await self._wipe_and_create_empty(
+                source.size,
+            )
 
             if isinstance(source, qubes.storage.file.FileVolume):
                 # File volume export() does not actually return a coroutine.
@@ -1841,6 +1866,7 @@ class ZFSVolume(qubes.storage.Volume):
         await self.pool.accessor.create_volume_async(
             self.volume,
             size,
+            self._auto_snapshot_policy,
             log=self.log,
         )
 
@@ -2153,7 +2179,13 @@ class ZFSVolume(qubes.storage.Volume):
         return self
 
     async def export(self) -> str:
-        """Returns an object that can be `open()`."""
+        """
+        Returns an object that can be `open()`.
+
+        Writes to the object will not be persisted in this volume.  It is
+        expected that the calle will eventually call `export_end()` at which
+        time the exported volume will be destroyed.
+        """
         self.log.debug("Start of export of %s", self.volume)
         if not self.save_on_stop:
             raise NotImplementedError(
@@ -2165,12 +2197,15 @@ class ZFSVolume(qubes.storage.Volume):
         await self.pool.accessor.clone_snapshot_to_volume_async(
             VolumeSnapshot.make(self.volume, latest_snap),
             Volume.make(exported),
+            NO_AUTO_SNAPSHOT,
             log=self.log,
         )
         return os.path.join(ZVOL_DIR, exported)
 
     async def export_end(self, path: str) -> None:
-        """Removes the previous export."""
+        """
+        Removes the previous export.
+        """
         self.log.debug(
             "End of export of %s to path %s",
             self.volume,
@@ -2259,7 +2294,12 @@ class ZFSVolume(qubes.storage.Volume):
         self.abort_if_import_in_progress()
         imp = self.importing_volume_name
         self.log.debug("Creating volume for import %s with size %s", imp, size)
-        await self.pool.accessor.create_volume_async(imp, size, log=self.log)
+        await self.pool.accessor.create_volume_async(
+            imp,
+            size,
+            self._auto_snapshot_policy,
+            log=self.log,
+        )
         return os.path.join(ZVOL_DIR, imp)
 
     @qubes.storage.Volume.locked  # type: ignore
