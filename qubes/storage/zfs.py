@@ -674,6 +674,10 @@ class ZFSPool(qubes.storage.Pool):
                 # No volumes shall have their partitions exposed in dom0.
                 "-o",
                 "volmode=dev",
+                # Ensure Qubes OS knows this is a Qubes pool, as well
+                # as all descendant datasets, for udev purposes.
+                "-o",
+                "org.qubes-os:part-of-qvm-pool=true",
                 "-p",
                 self.container,
                 log=self.log,
