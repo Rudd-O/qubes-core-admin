@@ -572,6 +572,10 @@ class ZFSPool(qubes.storage.Pool):
         self.ephemeral_volatile = boolify(self.ephemeral_volatile)
         self.snap_on_start_forensics = boolify(snap_on_start_forensics)
         self._volume_objects_cache: Dict[Vid, ZFSVolume] = {}
+        self._cached_usage_time = 0.0
+        self._cached_size_time = 0.0
+        self._cached_usage = 0
+        self._cached_size = 0
         self.log = logging.getLogger("%s" % (self.name,))
         self.accessor: ZFSAccessor = ZFSAccessor(self.container)
 
@@ -707,17 +711,31 @@ class ZFSPool(qubes.storage.Pool):
     def size(self) -> int:
         """
         Return size in bytes of the pool
+
+        Value is never queried to the backend more than once in 30 seconds.
         """
-        return self.accessor.get_pool_size(log=self.log)
+        now = time.time()
+        if self._cached_size_time + 30 < now:
+            self._cached_size = self.accessor.get_pool_size(
+                log=self.log,
+            )
+        return self._cached_size
 
     @property
     def usage(self) -> int:
         """
         Return usage of pool in percent (0-100).
 
-        Synchronously refreshes the cache just like the LVM driver does.
+        Value is never queried to the backend more than once in 30 seconds.
         """
-        return self.size - self.accessor.get_pool_available(log=self.log)
+        now = time.time()
+        if self._cached_usage_time + 30 < now:
+            self._cached_usage = self.accessor.get_pool_size(
+                log=self.log,
+            ) - self.accessor.get_pool_available(
+                log=self.log,
+            )
+        return self._cached_usage
 
 
 ZFSPropertyBag = TypedDict(
