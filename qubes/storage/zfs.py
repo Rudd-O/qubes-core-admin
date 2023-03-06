@@ -704,8 +704,7 @@ class ZFSPool(qubes.storage.Pool):
 
         Synchronously refreshes the cache just like the LVM driver does.
         """
-        usage = self.size - self.accessor.get_pool_available(log=self.log)
-        return int(usage / self.accessor.get_pool_size(log=self.log) * 100)
+        return self.size - self.accessor.get_pool_available(log=self.log)
 
 
 ZFSPropertyBag = TypedDict(
