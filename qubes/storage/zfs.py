@@ -719,6 +719,7 @@ class ZFSPool(qubes.storage.Pool):
             self._cached_size = self.accessor.get_pool_size(
                 log=self.log,
             )
+            self._cached_size_time = now
         return self._cached_size
 
     @property
@@ -735,6 +736,7 @@ class ZFSPool(qubes.storage.Pool):
             ) - self.accessor.get_pool_available(
                 log=self.log,
             )
+            self._cached_usage_time = now
         return self._cached_usage
 
 
