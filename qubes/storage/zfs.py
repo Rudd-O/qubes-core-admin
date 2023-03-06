@@ -2207,6 +2207,10 @@ class ZFSVolume(qubes.storage.Volume):
 
         Calls `_wipe_and_clone_from()`.
         """
+        if not self.save_on_stop:
+            # Nothing to import.  This volume will be blown up
+            # next time its owning VM starts up.
+            return self
         self.log.debug(
             "Importing volume %s from source %s",
             self.volume,
