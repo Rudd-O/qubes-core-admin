@@ -38,6 +38,7 @@ from typing import (
 ZVOL_DIR = "/dev/zvol"
 EXPORTED = ".exported"
 IMPORTING = ".importing"
+CLONING = ".cloning"
 REVISION_PREFIX = "qubes"
 QUBES_POOL_FLAG = "org.qubes-os:part-of-qvm-pool"
 CLEAN_SNAPSHOT = "qubes-clean"
@@ -1880,6 +1881,18 @@ class ZFSVolume(qubes.storage.Volume):
             )
             self.log.debug("Removed import %s", vol)
 
+    async def _remove_volume_clone_if_exists(self) -> None:
+        vol = self.cloning_volume_name
+        if await self.pool.accessor.volume_exists_async(
+            vol,
+            log=self.log,
+        ):
+            await self.pool.accessor.remove_volume_retried_async(
+                vol,
+                log=self.log,
+            )
+            self.log.debug("Removed import %s", vol)
+
     async def _remove_volume_if_exists(self) -> None:
         if await self.pool.accessor.volume_exists_async(
             self.volume,
@@ -1893,78 +1906,61 @@ class ZFSVolume(qubes.storage.Volume):
     async def _remove_volume_and_derived(self) -> "ZFSVolume":
         await self._remove_volume_import_if_exists()
         await self._remove_volume_export_if_exists()
+        await self._remove_volume_clone_if_exists()
         await self._remove_volume_if_exists()
         return self
 
     async def _wipe_and_clone_from(self, source: qubes.storage.Volume) -> None:
         """
-        Clones this volume from the source.
+        Clones this volume from the source, atomically.
 
-        If a volume existed before calling this, its data will be lost.
+        If a volume existed before calling this, its data will be lost after
+        this function returns successfully.  In case of error while copying
+        the data from the source, the existing volume will remain untouched.
 
-        Upon return, a bit-by-bit identical copy of the source exists
-        in this volume.  If the source volume is a `ZFSVolume`, then
-        the copy was performed using copy-on-write.
+        Upon successful return, a bit-by-bit identical copy of the source
+        exists in this volume.  Snapshots in this volume (the destination of
+        the clone) will be erased too.  If the source volume is a `ZFSVolume`,
+        then the copy was performed efficiently using copy-on-write.
         """
-        # FIXME find a way to make the wipe and clone atomic, by first cloning
+        # FIXME: find a way to make the wipe and clone atomic, by first cloning
         # then wiping.  May not be worth doing because of increased disk space
         # requirements which would bite the user in tight storage situations.
-        self.log.debug("Cloning into %s from %s", self.volume, source)
         if isinstance(source, ZFSVolume):
             # The source device is a ZFS one;
             # simply find out what its latest qubes snapshot is,
             # then clone it from there.
             self.log.debug("Source is a ZFS volume")
-            await self._remove_volume_if_exists()
             try:
                 src = source.latest_clean_snapshot[0]
-                self.log.debug(
-                    "Creating volume %s with cloning from %s",
-                    self.volume,
-                    src,
-                )
-                await self.pool.accessor.clone_snapshot_to_volume_async(
-                    src,
-                    self.volume,
-                    self._auto_snapshot_policy,
-                    log=self.log,
-                )
             except DatasetDoesNotExist:
                 src = VolumeSnapshot.make(
                     source.volume,
                     source.latest_revision[0],
                 )
-                self.log.warning(
-                    "No clean snapshot; creating volume "
-                    "%s with fallback cloning from %s",
-                    self.volume,
-                    src,
-                )
-                await self.pool.accessor.clone_snapshot_to_volume_async(
-                    src,
-                    self.volume,
-                    self._auto_snapshot_policy,
-                    log=self.log,
-                )
-
+            self.log.debug(
+                "Cloning from %s into %s via zfs clone",
+                self.volume,
+                src,
+            )
+            await self.pool.accessor.clone_snapshot_to_volume_async(
+                src,
+                self.cloning_volume_name,
+                self._auto_snapshot_policy,
+                log=self.log,
+            )
         else:
             # Source is not a ZFS one;
             # create the dataset with the size of the
             # source (or larger if requested by user)
             # and dd the contents sparsely.
             self.log.debug("Source is not a ZFS volume")
-            # FIXME optimize, if the volume exists but is smaller
-            # than the source, simply grow the volume instead of
-            # nuking it completely.
             self.log.debug(
-                "Creating empty volume %s for cloning with size %s",
+                "Copying from %s into %s with size %s",
+                source.vid,
                 self.volume,
                 source.size,
             )
-            await self._wipe_and_create_empty(
-                source.size,
-            )
-
             if isinstance(source, qubes.storage.file.FileVolume):
                 # File volume export() does not actually return a coroutine.
                 # This isn't just a typing error.  The await() fails.
@@ -1975,7 +1971,8 @@ class ZFSVolume(qubes.storage.Volume):
                 )  # type:ignore
             else:
                 infile = await source.export()  # type:ignore
-            outfile = os.path.join(ZVOL_DIR, self.volume)
+            await self._wipe_and_create_empty(source.size, True)
+            outfile = os.path.join(ZVOL_DIR, self.cloning_volume_name)
             try:
                 self.log.debug(
                     "Copying %s to %s",
@@ -1983,20 +1980,49 @@ class ZFSVolume(qubes.storage.Volume):
                     outfile,
                 )
                 await duplicate_disk(infile, outfile, self.log)
+            except qubes.storage.StoragePoolException:
+                await self._remove_volume_clone_if_exists()
             finally:
                 await source.export_end(infile)  # type:ignore
+        try:
+            await self._remove_volume_if_exists()
+        except Exception:
+            await self._remove_volume_clone_if_exists()
+            raise
+        self.log.debug(
+            "Renaming %s to %s",
+            self.cloning_volume_name,
+            self.volume,
+        )
+        await self.pool.accessor.rename_volume_async(
+            self.cloning_volume_name,
+            self.volume,
+            log=self.log,
+        )
 
     async def _wipe_and_create_empty(
         self,
         size: Optional[int] = None,
+        temploc: bool = False,
     ) -> None:
+        """
+        Wipe a dataset and create it empty.
+
+        If `temploc` is true, then the cloning volume path
+        will be used, rather than the final destination.
+        """
         # FIXME: optimization -- if both volumes are the same
         # size, or the requested size is larger than the
         # current size, then instead of deleting the volume,
-        # grow the volume if needed, then wipe the volume by using
-        # BLKDISCARD, so it returns zeroes before we return to
-        # the caller.
-        await self._remove_volume_if_exists()
+        # BLKDISCARD the volume and then grow the size of the
+        # volume, so it returns zeroes all over the place before
+        # we return to the caller.  Confirm via experimentation
+        # and unit testing that the newly-added tail of the volume
+        # returns zeroes — perhaps it is not necessary.
+        if temploc:
+            await self._remove_volume_clone_if_exists()
+        else:
+            await self._remove_volume_if_exists()
         size = size if size is not None else self._size
         self.log.debug(
             "Creating empty volume %s with size %s",
@@ -2004,7 +2030,7 @@ class ZFSVolume(qubes.storage.Volume):
             size,
         )
         await self.pool.accessor.create_volume_async(
-            self.volume,
+            self.cloning_volume_name if temploc else self.volume,
             size,
             self._auto_snapshot_policy,
             log=self.log,
@@ -2031,6 +2057,16 @@ class ZFSVolume(qubes.storage.Volume):
             os.path.join(
                 self.pool.container,
                 IMPORTING,
+                self.vid.replace("/", "_"),
+            )
+        )
+
+    @property
+    def cloning_volume_name(self) -> Volume:
+        return Volume.make(
+            os.path.join(
+                self.pool.container,
+                CLONING,
                 self.vid.replace("/", "_"),
             )
         )
@@ -2325,8 +2361,8 @@ class ZFSVolume(qubes.storage.Volume):
         Returns an object that can be `open()`.
 
         Writes to the object will not be persisted in this volume.  It is
-        expected that the calle will eventually call `export_end()` at which
-        time the exported volume will be destroyed.
+        expected that the caller will eventually call `export_end()` at
+        which time the exported volume will be destroyed.
         """
         self.log.debug("Start of export of %s", self.volume)
         if not self.save_on_stop:
@@ -2338,30 +2374,19 @@ class ZFSVolume(qubes.storage.Volume):
         dest_dset = Volume.make(exported)
         try:
             src = self.latest_clean_snapshot[0]
-            self.log.debug(
-                "Exporting %s via cloning from %s",
-                dest_dset,
-                src,
-            )
-            await self.pool.accessor.clone_snapshot_to_volume_async(
-                src,
-                dest_dset,
-                NO_AUTO_SNAPSHOT,
-                log=self.log,
-            )
         except DatasetDoesNotExist:
             src = VolumeSnapshot.make(self.volume, self.latest_revision[0])
-            self.log.warning(
-                "No clean snapshot; exporting %s via fallback cloning from %s",
-                dest_dset,
-                src,
-            )
-            await self.pool.accessor.clone_snapshot_to_volume_async(
-                src,
-                dest_dset,
-                NO_AUTO_SNAPSHOT,
-                log=self.log,
-            )
+        self.log.debug(
+            "Exporting %s via cloning from %s",
+            dest_dset,
+            src,
+        )
+        await self.pool.accessor.clone_snapshot_to_volume_async(
+            src,
+            dest_dset,
+            NO_AUTO_SNAPSHOT,
+            log=self.log,
+        )
         return os.path.join(ZVOL_DIR, exported)
 
     async def export_end(self, path: str) -> None:
@@ -2376,6 +2401,8 @@ class ZFSVolume(qubes.storage.Volume):
         suffix = os.path.basename(path)
         # FIXME: if the last export of the volume is removed, then
         # the parent dataset ".exported" should be removed too.
+        # This is not too urgent, as empty datasets are 40kb ea.
+        # but their removal could help have a neater `zfs list`.
         await self._remove_volume_export_if_exists(suffix)
 
     def block_device(self) -> qubes.storage.BlockDevice:
@@ -2513,7 +2540,14 @@ class ZFSVolume(qubes.storage.Volume):
         # volume, whether it be by having to stop the VM first and
         # then making a non-atomic clone / partial copy / rename
         # of a zvol.  It is annoying that ZFS prevents volumes from
-        # being reduced in size.
+        # being reduced in size.  It is further annoying that
+        # reduction of a volume requires the file system in it to
+        # be reduced first, which can only be done while the qube
+        # is running, but a Towers-of-Hanoi operation with datasets
+        # can only be performed with the qube off.  Perhaps in the
+        # future we can have a qvm feature exposed that allows dom0
+        # to coordinate shrinking the file system and defers the
+        # Towers-of-Hanoi operation to after the qube has powered off.
         self.log.debug("Resizing %s to %s", self.volume, size)
         mysize = self.size
         if size == mysize:

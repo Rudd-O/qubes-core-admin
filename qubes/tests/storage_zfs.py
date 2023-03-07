@@ -5,6 +5,7 @@
 # pylint: disable=invalid-name
 
 import asyncio
+import dataclasses
 import logging
 import os
 import shlex
@@ -21,6 +22,7 @@ import qubes.tests.storage as ts
 import qubes.vm.appvm
 
 from typing import Tuple, Dict, Any, List, Coroutine, Optional
+from unittest.mock import patch
 
 DUMP_POOL_AFTER_EACH_TEST = os.getenv("ZFS_DUMP_POOL_AFTER_EACH_TEST", "")
 # DUMP_POOL_AFTER_EACH_TEST = True
@@ -758,3 +760,71 @@ class TC_10_ZFSPool(ZFSBase):
             v.importing_volume_name,
             join(v.pool.container, ".importing", v.vid.replace("/", "_")),
         )
+
+    def test_025_failed_import_volume_is_safe(self) -> None:
+        """
+        Test that a midway-interrupted failed volume import preserves the
+        data on the destination volume when the import fails midway.
+        """
+
+        @dataclasses.dataclass
+        class Voldata:
+            vol: zfs.ZFSVolume
+            data: str
+
+        src = Voldata(
+            self.get_vol(ONEMEG_SAVE_ON_STOP, name="025-source"),
+            "source",
+        )
+        tgt = Voldata(
+            self.get_vol(ONEMEG_SAVE_ON_STOP, name="025-target"),
+            "target",
+        )
+
+        def init():
+            for vol in [src, tgt]:
+                # Make the volume.
+                self.rc(vol.vol.create())
+                # Start and write some data to it, then stop.
+                self.rc(vol.vol.start())
+                voldev = os.path.join(zfs.ZVOL_DIR, vol.vol.volume)
+                self.write(voldev, vol.data)
+                self.rc(vol.vol.stop())
+
+        def deinit():
+            for vol in [src, tgt]:
+                self.rc(vol.vol.remove())
+
+        # First init.
+        init()
+        self.rc(tgt.vol.import_volume(src.vol))
+
+        # Check the successful, happy path first.
+        self.rc(tgt.vol.start())
+        voldev = os.path.join(zfs.ZVOL_DIR, tgt.vol.volume)
+        r = self.read(voldev, 10)
+        assert r.startswith(src.data), "volume did not commit correctly"
+        self.rc(tgt.vol.stop())
+
+        # Reinitialize.
+        deinit()
+        init()
+
+        # Mock a failure
+        with patch.object(
+            tgt.vol.pool.accessor,
+            "clone_snapshot_to_volume_async",
+            side_effect=storage.StoragePoolException("mocked failure!"),
+        ):
+            with self.assertRaises(storage.StoragePoolException):
+                # Fail clone!
+                self.rc(tgt.vol.import_volume(src.vol))
+
+        self.rc(tgt.vol.start())
+        voldev = os.path.join(zfs.ZVOL_DIR, tgt.vol.volume)
+        r = self.read(voldev, 10)
+        assert r.startswith(tgt.data), "error handler did not keep target safe"
+        self.rc(tgt.vol.stop())
+
+        # Fin
+        deinit()
