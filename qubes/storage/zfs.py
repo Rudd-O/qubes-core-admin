@@ -31,6 +31,7 @@ from typing import (
     Tuple,
     Coroutine,
     Literal,
+    TypeVar,
     Callable,
     Type,
     Set,
@@ -99,15 +100,18 @@ def get_random_string(
     length: int,
     character_set: str = string.ascii_lowercase,
 ) -> str:
-    return "".join(random.choice(character_set) for i in range(length))
+    return "".join(random.choice(character_set) for _ in range(length))
+
+
+T = TypeVar("T")
 
 
 async def retry_async(
-    kallable: Callable[[], Coroutine[None, None, Any]],
+    kallable: Callable[[], Coroutine[None, None, T]],
     exception_class: Type[BaseException],
     times: int,
     sleep_between_tries: float,
-) -> Any:
+) -> T:
     counter = times
     while True:
         try:
@@ -411,6 +415,12 @@ class Volume(str):
     def snapshot(self, snapshot_name: str) -> "VolumeSnapshot":
         return VolumeSnapshot.make(self, snapshot_name)
 
+    def clean_snapshot(self) -> "VolumeSnapshot":
+        return VolumeSnapshot.make(
+            self,
+            CLEAN_SNAPSHOT + "-" + get_random_string(8),
+        )
+
 
 class VolumeSnapshot(str):
     @classmethod
@@ -426,6 +436,9 @@ class VolumeSnapshot(str):
     @property
     def volume(self) -> "Volume":
         return Volume(self.split("@", maxsplit=1)[0])
+
+    def is_clean_snapshot(self) -> bool:
+        return self.snapshot.startswith(CLEAN_SNAPSHOT)
 
 
 class ZFSPoolConfig(TypedDict):
@@ -1826,19 +1839,16 @@ class ZFSVolume(qubes.storage.Volume):
             )
         return
 
-    async def _create_clean_snapshot(self):
+    async def _mark_clean(self):
         existing_cleans = [
             s
             for s in await self.pool.accessor.get_volume_snapshots_async(
                 self.volume,
                 log=self.log,
             )
-            if s.startswith(CLEAN_SNAPSHOT)
+            if s.is_clean_snapshot()
         ]
-        new = VolumeSnapshot.make(
-            self.volume,
-            CLEAN_SNAPSHOT + "-" + get_random_string(8),
-        )
+        new = self.volume.clean_snapshot()
         await self.pool.accessor.snapshot_volume_async(new, log=self.log)
         for old in existing_cleans:
             await self.pool.accessor.remove_volume_async(
@@ -2263,7 +2273,7 @@ class ZFSVolume(qubes.storage.Volume):
             await self._wipe_and_create_empty()
             # Make initial clean snapshot so this volume can be cloned later.
             await self._create_revision("after-create")
-            await self._create_clean_snapshot()
+            await self._mark_clean()
 
         else:
             self.log.debug(
@@ -2403,7 +2413,7 @@ class ZFSVolume(qubes.storage.Volume):
                     log=self.log,
                 )
                 # Make clean snapshot so this volume can be cloned later.
-                await self._create_clean_snapshot()
+                await self._mark_clean()
 
         elif snap_on_start:
             # Root / reset-on-start.
@@ -2522,7 +2532,7 @@ class ZFSVolume(qubes.storage.Volume):
         await self._wipe_and_clone_from(src_volume)
         # Make clean snapshot so this volume can be cloned later.
         await self._create_revision("after-import-volume")
-        await self._create_clean_snapshot()
+        await self._mark_clean()
         return self
 
     def abort_if_import_in_progress(self) -> None:
@@ -2574,7 +2584,7 @@ class ZFSVolume(qubes.storage.Volume):
             )
             # Make initial clean snapshot so this volume can be cloned later.
             await self._create_revision("after-import-data")
-            await self._create_clean_snapshot()
+            await self._mark_clean()
         else:
             await self._remove_volume_import_if_exists()
 
@@ -2697,7 +2707,7 @@ class ZFSVolume(qubes.storage.Volume):
                 self.volume,
                 log=self.log,
             ).items()
-            if snap.snapshot.startswith(CLEAN_SNAPSHOT)
+            if snap.is_clean_snapshot()
         ]
         if not allclean:
             raise DatasetDoesNotExist(
@@ -2769,7 +2779,7 @@ class ZFSVolume(qubes.storage.Volume):
                 snapobj,
                 log=self.log,
             )
-        await self._create_clean_snapshot()
+        await self._mark_clean()
         return self
 
     async def verify(self) -> bool:

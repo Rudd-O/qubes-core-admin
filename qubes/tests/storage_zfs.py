@@ -283,6 +283,10 @@ class TC_01_ZFSPool_solidstate(AsyncLoopHolderMixin):
             )
         )
 
+    def test_is_clean_snapshot(self):
+        snap = zfs.VolumeSnapshot.make("dataset", "qubes-clean-SnefS")
+        assert snap.is_clean_snapshot()
+
     def test_dd(self):
         log = logging.getLogger(__name__)
         with tempfile.TemporaryDirectory() as tmpdir:
