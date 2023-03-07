@@ -40,6 +40,14 @@ ZVOL_DIR = "/dev/zvol"
 EXPORTED = ".exported"
 IMPORTING = ".importing"
 REVISION_PREFIX = "qubes"
+QUBES_POOL_FLAG = "org.qubes-os:part-of-qvm-pool"
+# Controls whether `qvm-pool remove` destroys a pool if
+# the pool is the root of a ZFS pool.  By default it
+# is false because the user may have created a Qubes
+# storage pool in the root of a ZFS pool by mistake,
+# and therefore removal of the storage pool could lead to
+# unrelated datasets being catastrophically destroyed.
+DESTROY_ROOT_POOLS = False
 
 # Sentinel value for auto-snapshot policy:
 # Do not let zfs-auto-snapshot create useless snapshots
@@ -597,27 +605,6 @@ class ZFSPool(qubes.storage.Pool):
             }
         )
 
-    async def destroy(self) -> None:
-        """
-        Destroy this pool.  The container will be gone after calling this.
-        """
-        try:
-            await zfs_async(
-                "list",
-                self.container,
-                log=self.log,
-            )
-        except qubes.storage.StoragePoolException:
-            # Pool container does not exist anymore.
-            return
-        self.log.info("Deleting container dataset %s", self.container)
-        await zfs_async(
-            "destroy",
-            "-r",
-            self.container,
-            log=self.log,
-        )
-
     def init_volume(
         self,
         vm: qubes.vm.qubesvm.QubesVM,
@@ -663,11 +650,27 @@ class ZFSPool(qubes.storage.Pool):
 
     async def __init_container(self) -> None:
         try:
-            await zfs_async(
+            ret = await zfs_async(
                 "list",
+                "-H",
+                "-o",
+                f"name,{QUBES_POOL_FLAG}",
                 self.container,
                 log=self.log,
             )
+            val = ret.splitlines()[0].split("\t")
+            if val != "true":
+                # Probably a root pool!  It already exists, but doesn't
+                # have the flag.  So we flag it here.  Mere existence
+                # is not enough to determine if the pool has already been
+                # flagged as a ZFS pool (needed because of udev rules).
+                await zfs_async(
+                    "set",
+                    f"{QUBES_POOL_FLAG}=true",
+                    "volmode=dev",
+                    self.container,
+                    log=self.log,
+                )
         except qubes.storage.StoragePoolException:
             self.log.info("Creating container dataset %s", self.container)
             await zfs_async(
@@ -681,7 +684,7 @@ class ZFSPool(qubes.storage.Pool):
                 # Ensure Qubes OS knows this is a Qubes pool, as well
                 # as all descendant datasets, for udev purposes.
                 "-o",
-                "org.qubes-os:part-of-qvm-pool=true",
+                f"{QUBES_POOL_FLAG}=true",
                 "-p",
                 self.container,
                 log=self.log,
@@ -691,6 +694,74 @@ class ZFSPool(qubes.storage.Pool):
         # Trip here to prevent pool being added without ZFS.
         check_zfs_available()
         await self.__init_container()
+
+    async def destroy(self) -> None:
+        """
+        Destroy this pool.  The container will be gone after calling this.
+        """
+        try:
+            await zfs_async(
+                "list",
+                self.container,
+                log=self.log,
+            )
+        except qubes.storage.StoragePoolException:
+            # Pool container does not exist anymore.
+            return
+
+        # Pool exists.  Is it the root of a pool or not?
+        if "/" in self.container:
+            # This is a child dataset of the root of a pool.
+            # Safe to destroy recursively.
+            self.log.info("Deleting container dataset %s", self.container)
+            await zfs_async(
+                "destroy",
+                "-r",
+                self.container,
+                log=self.log,
+            )
+        else:
+            # This is the root of a pool.  We only destroy children here.
+            # Thus, only select the immediate children for recursive delete,
+            # because zfs destroy does not work on the root dataset of a pool.
+            # To prevent data loss in datasets unrelated to the Qubes pool,
+            # we only destroy if a boolean is set, which by default is unset.
+            if DESTROY_ROOT_POOLS:
+                datasets_to_delete = [
+                    dset
+                    for dset in (
+                        await zfs_async(
+                            "list",
+                            "-r",
+                            "-o",
+                            "name",
+                            self.container,
+                            log=self.log,
+                        )
+                    ).splitlines()
+                    if len(dset.split("/")) == 2
+                ]
+                for dset in reversed(datasets_to_delete):
+                    await zfs_async(
+                        "destroy",
+                        "-r",
+                        dset,
+                        log=self.log,
+                    )
+            # Restore volmode to default.
+            await zfs_async(
+                "inherit",
+                "volmode",
+                self.container,
+                log=self.log,
+            )
+            # Remove Qubes pool flag.
+            await zfs_async(
+                "inherit",
+                QUBES_POOL_FLAG,
+                self.container,
+                log=self.log,
+            )
 
     def get_volume(self, vid: Vid) -> "ZFSVolume":
         """Return a volume with given vid"""
