@@ -1982,6 +1982,7 @@ class ZFSVolume(qubes.storage.Volume):
                 await duplicate_disk(infile, outfile, self.log)
             except qubes.storage.StoragePoolException:
                 await self._remove_volume_clone_if_exists()
+                raise
             finally:
                 await source.export_end(infile)  # type:ignore
         try:
