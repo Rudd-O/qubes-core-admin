@@ -27,6 +27,7 @@ from typing import (
     List,
     Union,
     Any,
+    AsyncIterator,
     Tuple,
     Coroutine,
     Literal,
@@ -38,7 +39,7 @@ from typing import (
 ZVOL_DIR = "/dev/zvol"
 EXPORTED = ".exported"
 IMPORTING = ".importing"
-CLONING = ".cloning"
+TMP = ".tmp"
 REVISION_PREFIX = "qubes"
 QUBES_POOL_FLAG = "org.qubes-os:part-of-qvm-pool"
 CLEAN_SNAPSHOT = "qubes-clean"
@@ -211,6 +212,11 @@ async def duplicate_disk(
 
     if not os.access(outpath, os.W_OK) or not os.access(inpath, os.R_OK):
         thecmd = [_sudo] + thecmd
+    log.debug(
+        "Duplicating %s to %s",
+        inpath,
+        outpath,
+    )
     log.debug("Invoked with arguments %r", thecmd)
     p = await asyncio.create_subprocess_exec(*thecmd)
     ret = await p.wait()
@@ -1881,8 +1887,8 @@ class ZFSVolume(qubes.storage.Volume):
             )
             self.log.debug("Removed import %s", vol)
 
-    async def _remove_volume_clone_if_exists(self) -> None:
-        vol = self.cloning_volume_name
+    async def _remove_tmp_volume_if_exists(self) -> None:
+        vol = self.tmp_volume_name
         if await self.pool.accessor.volume_exists_async(
             vol,
             log=self.log,
@@ -1906,7 +1912,7 @@ class ZFSVolume(qubes.storage.Volume):
     async def _remove_volume_and_derived(self) -> "ZFSVolume":
         await self._remove_volume_import_if_exists()
         await self._remove_volume_export_if_exists()
-        await self._remove_volume_clone_if_exists()
+        await self._remove_tmp_volume_if_exists()
         await self._remove_volume_if_exists()
         return self
 
@@ -1923,9 +1929,6 @@ class ZFSVolume(qubes.storage.Volume):
         the clone) will be erased too.  If the source volume is a `ZFSVolume`,
         then the copy was performed efficiently using copy-on-write.
         """
-        # FIXME: find a way to make the wipe and clone atomic, by first cloning
-        # then wiping.  May not be worth doing because of increased disk space
-        # requirements which would bite the user in tight storage situations.
         if isinstance(source, ZFSVolume):
             # The source device is a ZFS one;
             # simply find out what its latest qubes snapshot is,
@@ -1938,79 +1941,38 @@ class ZFSVolume(qubes.storage.Volume):
                     source.volume,
                     source.latest_revision[0],
                 )
-            self.log.debug(
-                "Cloning from %s into %s via zfs clone",
-                self.volume,
-                src,
-            )
-            await self.pool.accessor.clone_snapshot_to_volume_async(
-                src,
-                self.cloning_volume_name,
-                self._auto_snapshot_policy,
-                log=self.log,
-            )
+            async with self._clone_volume_2phase(src):
+                # Do nothing.  The context manager takes care of everything.
+                pass
         else:
             # Source is not a ZFS one;
             # create the dataset with the size of the
             # source (or larger if requested by user)
             # and dd the contents sparsely.
-            self.log.debug("Source is not a ZFS volume")
-            self.log.debug(
-                "Copying from %s into %s with size %s",
-                source.vid,
-                self.volume,
-                source.size,
-            )
             if isinstance(source, qubes.storage.file.FileVolume):
+                self.log.debug("Source is a File volume")
                 # File volume export() does not actually return a coroutine.
                 # This isn't just a typing error.  The await() fails.
                 loop = asyncio.get_event_loop()
-                infile = await loop.run_in_executor(
+                in_ = await loop.run_in_executor(
                     None,
                     source.export,
                 )  # type:ignore
             else:
-                infile = await source.export()  # type:ignore
-            await self._wipe_and_create_empty(source.size, True)
-            outfile = os.path.join(ZVOL_DIR, self.cloning_volume_name)
+                self.log.debug("Source is not a ZFS volume")
+                in_ = await source.export()  # type:ignore
             try:
-                self.log.debug(
-                    "Copying %s to %s",
-                    infile,
-                    outfile,
-                )
-                await duplicate_disk(infile, outfile, self.log)
-            except qubes.storage.StoragePoolException:
-                await self._remove_volume_clone_if_exists()
-                raise
+                async with self._copy_into_volume_2phase(source.size) as out:
+                    await duplicate_disk(in_, out, self.log)
             finally:
-                await source.export_end(infile)  # type:ignore
-        try:
-            await self._remove_volume_if_exists()
-        except Exception:
-            await self._remove_volume_clone_if_exists()
-            raise
-        self.log.debug(
-            "Renaming %s to %s",
-            self.cloning_volume_name,
-            self.volume,
-        )
-        await self.pool.accessor.rename_volume_async(
-            self.cloning_volume_name,
-            self.volume,
-            log=self.log,
-        )
+                await source.export_end(in_)  # type:ignore
 
     async def _wipe_and_create_empty(
         self,
         size: Optional[int] = None,
-        temploc: bool = False,
     ) -> None:
         """
-        Wipe a dataset and create it empty.
-
-        If `temploc` is true, then the cloning volume path
-        will be used, rather than the final destination.
+        Wipe a dataset and create it anew, empty.
         """
         # FIXME: optimization -- if both volumes are the same
         # size, or the requested size is larger than the
@@ -2020,10 +1982,7 @@ class ZFSVolume(qubes.storage.Volume):
         # we return to the caller.  Confirm via experimentation
         # and unit testing that the newly-added tail of the volume
         # returns zeroes — perhaps it is not necessary.
-        if temploc:
-            await self._remove_volume_clone_if_exists()
-        else:
-            await self._remove_volume_if_exists()
+        await self._remove_volume_if_exists()
         size = size if size is not None else self._size
         self.log.debug(
             "Creating empty volume %s with size %s",
@@ -2031,11 +1990,118 @@ class ZFSVolume(qubes.storage.Volume):
             size,
         )
         await self.pool.accessor.create_volume_async(
-            self.cloning_volume_name if temploc else self.volume,
+            self.volume,
             size,
             self._auto_snapshot_policy,
             log=self.log,
         )
+
+    def _make_tmp_commit_rollback(
+        self,
+    ) -> Tuple[
+        Callable[[], Coroutine[Any, Any, None]],
+        Callable[[], Coroutine[Any, Any, None]],
+    ]:
+        # This code constructs generic rollback and commit hooks
+        # for _start_clone and _start_copy, which conceptually
+        # are the same, but just differ in implementation.
+        async def rollback() -> None:
+            self.log.error("Rolling back clone/copy of %s", self.volume)
+            await self._remove_tmp_volume_if_exists()
+
+        async def finish() -> None:
+            self.log.debug("Finishing clone/copy of %s", self.volume)
+            try:
+                await self._remove_volume_if_exists()
+            except Exception:
+                await rollback()
+                raise
+            await self.pool.accessor.rename_volume_async(
+                self.tmp_volume_name,
+                self.volume,
+                log=self.log,
+            )
+            self.log.debug("Finished clone/copy of %s", self.volume)
+
+        return finish, rollback
+
+    @contextlib.asynccontextmanager
+    async def _clone_volume_2phase(
+        self,
+        src: VolumeSnapshot,
+    ) -> AsyncIterator[None]:
+        """
+        Wipe the matching temporary dataset and clone it from src.
+        Yield nothing, but work as a context.
+
+        Requires src VolumeSnapshot to exist.
+
+        If there is an error, the temporary dataset is rolled back.
+        If the context finishes without error, the temporary dataset
+        is committed to the volume.
+        """
+        await self._remove_tmp_volume_if_exists()
+        self.log.debug(
+            "Starting clone from %s into %s via zfs clone",
+            src,
+            self.tmp_volume_name,
+        )
+        await self.pool.accessor.clone_snapshot_to_volume_async(
+            src,
+            self.tmp_volume_name,
+            self._auto_snapshot_policy,
+            log=self.log,
+        )
+        finish, rollback = self._make_tmp_commit_rollback()
+        try:
+            yield
+            await finish()
+        except Exception:
+            await rollback()
+            raise
+
+    @contextlib.asynccontextmanager
+    async def _copy_into_volume_2phase(
+        self,
+        size: Optional[int] = None,
+    ) -> AsyncIterator[str]:
+        """
+        Wipe the matching temporary dataset and create it anew, empty,
+        in preparation for a copy.  Yield a writable path to the caller,
+        while working as a context.
+
+        If there is an error, the temporary dataset is rolled back.
+        If the context finishes without error, the temporary dataset
+        is committed to the volume.
+        """
+        # FIXME: optimization -- if both volumes are the same
+        # size, or the requested size is larger than the
+        # current size, then instead of deleting the volume,
+        # BLKDISCARD the volume and then grow the size of the
+        # volume, so it returns zeroes all over the place before
+        # we return to the caller.  Confirm via experimentation
+        # and unit testing that the newly-added tail of the volume
+        # returns zeroes — perhaps it is not necessary.
+        await self._remove_tmp_volume_if_exists()
+        size = size if size is not None else self._size
+        self.log.debug(
+            "Starting copy into %s with size %s with an empty volume",
+            self.tmp_volume_name,
+            size,
+        )
+        await self.pool.accessor.create_volume_async(
+            self.tmp_volume_name,
+            size,
+            self._auto_snapshot_policy,
+            log=self.log,
+        )
+        finish, rollback = self._make_tmp_commit_rollback()
+        try:
+            yield os.path.join(ZVOL_DIR, self.tmp_volume_name)
+            await finish()
+        except Exception:
+            await rollback()
+            raise
 
     @property
     def volume(self) -> Volume:
@@ -2063,11 +2129,11 @@ class ZFSVolume(qubes.storage.Volume):
         )
 
     @property
-    def cloning_volume_name(self) -> Volume:
+    def tmp_volume_name(self) -> Volume:
         return Volume.make(
             os.path.join(
                 self.pool.container,
-                CLONING,
+                TMP,
                 self.vid.replace("/", "_"),
             )
         )
