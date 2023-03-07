@@ -4,6 +4,7 @@ Driver for storing qube images in ZFS pool volumes.
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import os
 import random
@@ -439,6 +440,13 @@ class VolumeSnapshot(str):
 
     def is_clean_snapshot(self) -> bool:
         return self.snapshot.startswith(CLEAN_SNAPSHOT)
+
+
+@dataclasses.dataclass
+class VolumeSnapshotInfo:
+    name: VolumeSnapshot
+    creation: int
+    defer_destroy: bool
 
 
 class ZFSPoolConfig(TypedDict):
@@ -1183,12 +1191,13 @@ class ZFSAccessor:
                     # to blast from outer space.
                     already_promoted.add(volume_or_snapshot)
                     # List all the snapshots in the volume.
-                    snapshots = list(
-                        await self._get_volume_snapshots_async_nl(
+                    snapshots = [
+                        sninfo.name
+                        for sninfo in await self._get_volume_snapshots_async_nl(
                             volume_or_snapshot,
                             log=log,
                         )
-                    )
+                    ]
 
                 for snapshot in snapshots:
                     # For each snapshot, we're going to get all the clones
@@ -1484,10 +1493,10 @@ class ZFSAccessor:
         self,
         volume: Volume,
         log: logging.Logger,
-    ) -> Dict[VolumeSnapshot, int]:
+    ) -> List[VolumeSnapshotInfo]:
         """
-        Get all snapshots of the volume, as a dictionary of VolumeSnapshot
-        to creation date (int).
+        Get all snapshots of the volume, as a list of VolumeSnapshotInfo.
+        The list is sorted from oldest to newest.
 
         The volume must exist.
 
@@ -1497,14 +1506,14 @@ class ZFSAccessor:
         with contextlib.nullcontext():  # to preserve visual similitude
             snapshots = self._cache.get(volume, "snapshots")
             if snapshots is not None:
-                return cast(Dict[VolumeSnapshot, int], snapshots)
+                return cast(List[VolumeSnapshotInfo], snapshots)
             lines = [
                 s.split("\t")
                 for s in zfs(
                     "list",
                     "-Hp",
                     "-o",
-                    "name,creation",
+                    "name,creation,defer_destroy",
                     "-t",
                     "snapshot",
                     volume,
@@ -1512,10 +1521,22 @@ class ZFSAccessor:
                 ).splitlines()
                 if s
             ]
-            ret = {
-                VolumeSnapshot.make(s.split("@")[0], s.split("@")[1]): int(t)
-                for s, t in lines
-            }
+            ret = list(
+                sorted(
+                    [
+                        VolumeSnapshotInfo(
+                            VolumeSnapshot.make(
+                                s.split("@")[0],
+                                s.split("@")[1],
+                            ),
+                            int(t),
+                            d == "on",
+                        )
+                        for s, t, d in lines
+                    ],
+                    key=lambda m: m.creation,
+                )
+            )
             self._cache.set(volume, "snapshots", ret)
             return ret
 
@@ -1523,7 +1544,7 @@ class ZFSAccessor:
         self,
         volume: Volume,
         log: logging.Logger,
-    ) -> Dict[VolumeSnapshot, int]:
+    ) -> List[VolumeSnapshotInfo]:
         """
         Get all snapshots of the volume, as a dictionary of VolumeSnapshot
         to creation date (int).
@@ -1540,14 +1561,14 @@ class ZFSAccessor:
         self,
         volume: Volume,
         log: logging.Logger,
-    ) -> Dict[VolumeSnapshot, int]:
+    ) -> List[VolumeSnapshotInfo]:
         """
         Warning: never call this directly unless you hold self.cache.lock.
         """
         assert dataset_in_root(volume, self.root)
         snapshots = self._cache.get(volume, "snapshots")
         if snapshots is not None:
-            return cast(Dict[VolumeSnapshot, int], snapshots)
+            return cast(List[VolumeSnapshotInfo], snapshots)
         lines = [
             s.split("\t")
             for s in (
@@ -1555,7 +1576,7 @@ class ZFSAccessor:
                     "list",
                     "-Hp",
                     "-o",
-                    "name,creation",
+                    "name,creation,defer_destroy",
                     "-t",
                     "snapshot",
                     volume,
@@ -1564,10 +1585,22 @@ class ZFSAccessor:
             ).splitlines()
             if s
         ]
-        ret = {
-            VolumeSnapshot.make(s.split("@")[0], s.split("@")[1]): int(t)
-            for s, t in lines
-        }
+        ret = list(
+            sorted(
+                [
+                    VolumeSnapshotInfo(
+                        VolumeSnapshot.make(
+                            s.split("@")[0],
+                            s.split("@")[1],
+                        ),
+                        int(t),
+                        d == "on",
+                    )
+                    for s, t, d in lines
+                ],
+                key=lambda m: m.creation,
+            )
+        )
         self._cache.set(volume, "snapshots", ret)
         return ret
 
@@ -1833,20 +1866,19 @@ class ZFSVolume(qubes.storage.Volume):
         )
         num = self.revisions_to_keep
         for snapshot, _ in revs[num:]:
-            await self.pool.accessor.remove_volume_async(
-                VolumeSnapshot.make(self.vid, snapshot),
-                log=self.log,
-            )
+            vsn = VolumeSnapshot.make(self.vid, snapshot)
+            self.log.debug("Pruning %s", vsn)
+            await self.pool.accessor.remove_volume_async(vsn, log=self.log)
         return
 
     async def _mark_clean(self):
         existing_cleans = [
-            s
+            s.name
             for s in await self.pool.accessor.get_volume_snapshots_async(
                 self.volume,
                 log=self.log,
             )
-            if s.is_clean_snapshot()
+            if s.name.is_clean_snapshot()
         ]
         new = self.volume.clean_snapshot()
         await self.pool.accessor.snapshot_volume_async(new, log=self.log)
@@ -2174,10 +2206,12 @@ class ZFSVolume(qubes.storage.Volume):
             log=self.log,
         )
         revisions: Dict[str, str] = {}
-        for snapshot in snapshots:
-            if is_revision_dataset(snapshot):
-                timestamp = timestamp_from_revision(snapshot)
-                revisions[snapshot.snapshot] = qubes.storage.isodate(
+        for sninfo in snapshots:
+            if is_revision_dataset(sninfo.name) and not sninfo.defer_destroy:
+                # It is important to hide the already-deleted revisions,
+                # even if their deletion is deferred.
+                timestamp = timestamp_from_revision(sninfo.name)
+                revisions[sninfo.name.snapshot] = qubes.storage.isodate(
                     timestamp,
                 )  # type: ignore
         return revisions
@@ -2702,12 +2736,12 @@ class ZFSVolume(qubes.storage.Volume):
         This should rarely be the case.
         """
         allclean = [
-            (snap, tstamp)
-            for snap, tstamp in self.pool.accessor.get_volume_snapshots(
+            (sninfo.name, sninfo.creation)
+            for sninfo in self.pool.accessor.get_volume_snapshots(
                 self.volume,
                 log=self.log,
-            ).items()
-            if snap.is_clean_snapshot()
+            )
+            if sninfo.name.is_clean_snapshot()
         ]
         if not allclean:
             raise DatasetDoesNotExist(
@@ -2716,8 +2750,8 @@ class ZFSVolume(qubes.storage.Volume):
                     CLEAN_SNAPSHOT,
                 )
             )
-        sortedclean = list(sorted(allclean, key=lambda m: m[1]))
-        snap, tstamp = sortedclean[-1]
+        # The info comes pre-sorted oldest to newest.
+        snap, tstamp = allclean[-1]
         return snap, qubes.storage.isodate(tstamp)
 
     @property
