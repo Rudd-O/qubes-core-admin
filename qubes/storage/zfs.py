@@ -563,7 +563,7 @@ class ZFSPool(qubes.storage.Pool):
         self,
         *,
         name: str,
-        revisions_to_keep: int = 1,
+        revisions_to_keep: int = 2,
         container: str,
         ephemeral_volatile: bool = False,
         snap_on_start_forensics: bool = False,
@@ -1716,7 +1716,7 @@ class ZFSVolume(qubes.storage.Volume):
         name: str,
         pool: ZFSPool,
         vid: Vid,
-        revisions_to_keep: int = 1,
+        revisions_to_keep: int = 2,
         rw: bool = False,
         save_on_stop: bool = False,
         size: int = 0,
@@ -1751,7 +1751,8 @@ class ZFSVolume(qubes.storage.Volume):
         revisions_to_keep = int(revisions_to_keep)
         if snap_on_start or save_on_stop:
             # Non-volatile.  This type of dataset requires
-            # >= 1 # revisions to keep.
+            # >= 1 revisions to keep, and >= 2 if revert
+            # is to work meaningfully at all.
             if revisions_to_keep < 1:
                 err = "ZFSVolume %s needs >= 1 revisions to keep" % vid
                 raise qubes.storage.StoragePoolException(err)
@@ -2515,7 +2516,7 @@ class ZFSVolume(qubes.storage.Volume):
 
         If no revisions exist, raise `qubes.storage.StoragePoolException`.
 
-        Invariant: the latest revision is always clean.  All the code to create
+        Invariant: all revisions are always clean.  All the code to create
         new volumes from other volmes and export existing volumes relies on
         this invariant.  The user can screw this up by using low-level zfs
         snapshot command that create snapshots named just right at the exact
