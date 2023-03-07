@@ -130,9 +130,12 @@ def teardown_test_zfs_pool(data_file: str, pool_name: str) -> None:
     os.unlink(data_file)
 
 
-def dump_zfs_filesystems(text: str = "") -> None:
+def dump_zfs_filesystems(text: str = "", dataset: str = "") -> None:
     print(text, file=sys.stderr)
-    subprocess.call("zfs list -t all -o name,origin,used >&2", shell=True)
+    subprocess.call(
+        f"zfs list -t all -r -o name,origin,used {dataset}>&2",
+        shell=True,
+    )
 
 
 class AsyncLoopHolderMixin(qubes.tests.QubesTestCase):
@@ -195,7 +198,7 @@ class ZFSBase(AsyncLoopHolderMixin):
 
     def dump(self, text: str = "") -> None:
         """Helper method to type less."""
-        return dump_zfs_filesystems(text)
+        return dump_zfs_filesystems(text, self.pool.container)
 
     def assert_dataset_property_equals(
         self, dataset: str, propname: str, value: str
@@ -264,11 +267,19 @@ class TC_01_ZFSPool_solidstate(AsyncLoopHolderMixin):
 
     def test_timestamp_to_revision(self):
         self.assertEqual(
-            zfs.timestamp_to_revision(123, "abc"),
-            "qubes:abc:123.000000",
+            "dataset@" + zfs.timestamp_to_revision(123, "abc"),
+            "dataset@qubes:abc:123.000000",
         )
-        self.assertTrue(zfs.is_revision_dataset("qubes:cause:123"))
-        self.assertFalse(zfs.is_revision_dataset("qubes-cause-123"))
+        self.assertTrue(
+            zfs.is_revision_dataset(
+                zfs.VolumeSnapshot.make("dataset", "qubes:cause:123")
+            )
+        )
+        self.assertFalse(
+            zfs.is_revision_dataset(
+                zfs.VolumeSnapshot.make("dataset", "qubes-cause-123")
+            )
+        )
 
     def test_dd(self):
         log = logging.getLogger(__name__)
