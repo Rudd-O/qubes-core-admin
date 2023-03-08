@@ -55,6 +55,8 @@ DESTROY_ROOT_POOLS = False
 # If True, a volume revision is deleted once the volume
 # has been rolled back to it.
 DELETE_REVISION_UPON_REVERT = True
+# Knob to quickly enable debug logging as warning.
+DEBUG_IS_WARNING = False
 
 # Sentinel value for auto-snapshot policy:
 # Do not let zfs-auto-snapshot create useless snapshots
@@ -559,6 +561,8 @@ class ZFSPool(qubes.storage.Pool):
         self._cached_usage = 0
         self._cached_size = 0
         self.log = logging.getLogger("%s" % (self.name,))
+        if DEBUG_IS_WARNING:
+            self.log.debug = self.log.warning  # type:ignore
         self.accessor: ZFSAccessor = ZFSAccessor(self.container)
 
     def __repr__(self) -> str:
@@ -701,6 +705,7 @@ class ZFSPool(qubes.storage.Pool):
             # To prevent data loss in datasets unrelated to the Qubes pool,
             # we only destroy if a boolean is set, which by default is unset.
             if DESTROY_ROOT_POOLS:
+                self.log.info("Destroying datasets within %s", self.container)
                 datasets_to_delete = [
                     dset
                     for dset in (
@@ -722,6 +727,10 @@ class ZFSPool(qubes.storage.Pool):
                         dset,
                         log=self.log,
                     )
+            self.log.info(
+                "Reverting formerly Qubes-managed properties of %s defaults",
+                self.container,
+            )
             # Restore volmode to default.
             await zfs_async(
                 "inherit",
@@ -935,7 +944,7 @@ class ZFSAccessor:
         for line in text.splitlines():
             if not line.rstrip():
                 continue
-            fields = line.split("\n")
+            fields = line.split("\t")
             row: Dict[str, str] = {}
             for k, v in zip(columns, fields):
                 row[k] = v
@@ -1012,6 +1021,16 @@ class ZFSAccessor:
     ) -> None:
         await zfs_async("set", "%s=%s" % (propname, propval), volume, log=log)
 
+    def _ack_exists_nl(self, volume: Volume):
+        # This is just for the cache to efficiently
+        # set existence of a dataset and its parents.
+        # Must call with cache lock grabbed.
+        for components, _ in enumerate(volume.split("/")):
+            components += +1
+            dset = "/".join(volume.split("/")[:components])
+            if dataset_in_root(dset, self.root):
+                self._cache.set(Volume.make(dset), "exists", True)
+
     async def volume_exists_async(
         self,
         volume: Volume,
@@ -1027,16 +1046,30 @@ class ZFSAccessor:
                 # for all the volumes right away.  This is the
                 # most frequently-asked piece of information, so
                 # it makes sense to gather it right away.
+                props = [
+                    "name",
+                    "creation",
+                    "readonly",
+                    "org.qubes:dirty",
+                    "volsize",
+                ]
                 try:
                     res = await self._get_prop_table_async(
-                        Volume.make(self.root),
-                        ["name"],
-                        log=log,
-                        recursive=True,
+                        Volume.make(self.root), props, log=log, recursive=True
                     )
                     for row in res:
                         vol = Volume.make(row["name"])
                         self._cache.set(vol, "exists", True)
+                        if "creation" not in row:
+                            assert 0, row
+                        if row["creation"] != "-":
+                            crtn = int(row["creation"])
+                            self._cache.set(vol, "creation", crtn)
+                        rdnly = row["readonly"] == "on"
+                        self._cache.set(vol, "readonly", rdnly)
+                        drty = row["org.qubes:dirty"] == "on"
+                        self._cache.set(vol, "org.qubes:dirty", drty)
+                        self._cache.set(vol, "creation", int(row["creation"]))
                 except qubes.storage.StoragePoolException:
                     pass
                 self._initialized = True
@@ -1046,12 +1079,12 @@ class ZFSAccessor:
                 return cast(bool, cached)
             try:
                 await self._get_prop_async(volume, "name", log=log)
-                self._cache.set(volume, "exists", True)
+                self._ack_exists_nl(volume)
                 return True
             except qubes.storage.StoragePoolException:
-                pass
-            self._cache.set(volume, "exists", False)
-            return False
+                self._cache.invalidate_recursively(volume)
+                self._cache.set(volume, "exists", False)
+                return False
 
     def volume_exists(
         self,
@@ -1090,12 +1123,12 @@ class ZFSAccessor:
                 return cast(bool, cached)
             try:
                 self._get_prop(volume, "name", log=log)
-                self._cache.set(volume, "exists", True)
+                self._ack_exists_nl(volume)
                 return True
             except qubes.storage.StoragePoolException:
-                pass
-            self._cache.set(volume, "exists", False)
-            return False
+                self._cache.invalidate_recursively(volume)
+                self._cache.set(volume, "exists", False)
+                return False
 
     async def remove_volume_async(
         self,
@@ -1293,16 +1326,19 @@ class ZFSAccessor:
         """
         Atomically renames a volume to a new name.
 
-        The new name must not exist.
+        The new name must not exist.  The parent will be automatically created.
 
         When this function returns, the block device associated
         with the new name is confirmed to exist.
         """
         assert dataset_in_root(dest, self.root)
         async with self._cache.locked():
-            await zfs_async("rename", source, dest, log=log)
-            self._cache.invalidate_recursively(source)
+            await zfs_async("rename", "-p", source, dest, log=log)
+            if dataset_in_root(source, self.root):
+                self._cache.invalidate_recursively(source)
+                self._cache.set(source, "exists", False)
             self._cache.invalidate_recursively(dest)
+            self._ack_exists_nl(dest)
             devpath = os.path.join(ZVOL_DIR, dest)
             await wait_for_device_async(devpath)
 
@@ -1355,7 +1391,7 @@ class ZFSAccessor:
                 log=log,
             )
             self._cache.invalidate_recursively(volume)
-            self._cache.set(volume, "exists", True)
+            self._ack_exists_nl(volume)
             self._cache.set(volume, "volsize", size)
             devpath = os.path.join(ZVOL_DIR, volume)
             await wait_for_device_async(devpath)
@@ -1831,8 +1867,12 @@ class ZFSVolume(qubes.storage.Volume):
         self.snap_on_start_forensics = snap_on_start_forensics
         self.vid = vid
         self.log = logging.getLogger("%s" % (self.vid,))
+        if DEBUG_IS_WARNING:
+            self.log.debug = self.log.warning  # type:ignore
         if kwargs:
-            self.log.warning("Unsupported arguments received: %s", kwargs)
+            raise qubes.storage.StoragePoolException(
+                "Unsupported arguments received: %s" % ", ".join(kwargs),
+            )
         self._auto_snapshot_policy = (
             DEF_AUTO_SNAPSHOT if self.save_on_stop else NO_AUTO_SNAPSHOT
         )
@@ -1971,17 +2011,18 @@ class ZFSVolume(qubes.storage.Volume):
         the clone) will be erased too.  If the source volume is a `ZFSVolume`,
         then the copy was performed efficiently using copy-on-write.
         """
-        if isinstance(source, ZFSVolume):
-            # The source device is a ZFS one;
+        if isinstance(source, ZFSVolume) and source.pool == self.pool:
+            # The source device can be efficiently cloned;
             # simply find out what its latest qubes snapshot is,
             # then clone it from there.
-            self.log.debug("Source is a ZFS volume")
+            samepoolsource = cast(ZFSVolume, source)
+            self.log.debug("Source shares pool with me")
             try:
-                src = source.latest_clean_snapshot[0]
+                src = samepoolsource.latest_clean_snapshot[0]
             except DatasetDoesNotExist:
                 src = VolumeSnapshot.make(
-                    source.volume,
-                    source.latest_revision[0],
+                    samepoolsource.volume,
+                    samepoolsource.latest_revision[0],
                 )
             async with self._clone_volume_2phase(src):
                 # Do nothing.  The context manager takes care of everything.
