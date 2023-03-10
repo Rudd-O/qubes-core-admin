@@ -230,12 +230,6 @@ class ZFSBase(AsyncLoopHolderMixin):
 
 
 class TC_01_ZFSPool_solidstate(AsyncLoopHolderMixin):
-    def test_boolify(self):
-        self.assertEqual(zfs.boolify("on"), True)
-        self.assertEqual(zfs.boolify("False"), False)
-        with self.assertRaises(ValueError):
-            zfs.boolify("Neither truey nor falsey")
-
     def test_random_string(self):
         self.assertEqual(zfs.get_random_string(5, "a"), "aaaaa")
 

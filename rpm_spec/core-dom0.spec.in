@@ -76,7 +76,7 @@ Requires:       libvirt-python3
 
 Requires:       pciutils
 # ionice, for low-disk-impact dd during volume duplication.
-%if "x%{fc32}" == "x1"
+%if 0{?fedora} == 32
 # FC32 / Q4.1 builds don't have util-linux-core.
 Requires:       util-linux
 %else

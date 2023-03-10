@@ -69,29 +69,6 @@ DEF_AUTO_SNAPSHOT: Dict[str, str] = {}
 _sudo, _dd, _zfs, _zpool, _ionice = "sudo", "dd", "zfs", "zpool", "ionice"
 
 
-def boolify(val: Any) -> bool:
-    """Make input `val` into a bool."""
-    if isinstance(val, bool):
-        return bool(val)
-    if str(val) in [
-        "1",
-        "true",
-        "on",
-        "True",
-        "enabled",
-    ]:
-        return True
-    if str(val) in [
-        "0",
-        "false",
-        "off",
-        "False",
-        "disabled",
-    ]:
-        return False
-    raise ValueError(val)
-
-
 async def fail_unless_exists_async(path: str) -> None:
     if os.path.exists(path):
         return
@@ -156,11 +133,11 @@ def timestamp_to_revision(timestamp: Union[int, str, float], cause: str) -> str:
     Converts a timestamp to a revision.
 
     >>> timestamp_to_revision(123, "a")
-    qubes:a:123
+    qubes:a:123.000000
     >>> timestamp_to_revision(123.1, "b")
-    qubes:b:123
+    qubes:b:123.100000
     >>> timestamp_to_revision("123", "C")
-    qubes:C:123
+    qubes:C:123.000000
     """
     return "%s:%s:%.6f" % (REVISION_PREFIX, cause, float(timestamp))
 
@@ -173,7 +150,7 @@ def is_revision_dataset(fsname: "VolumeSnapshot") -> bool:
     True
     >>> is_revision_dataset("testvol/vm/private@qubes:after-x:123")
     True
-    >>> is_revision_dataset("testvol/vm/private@qubes:after-x:123")
+    >>> is_revision_dataset("testvol/vm/private@qubes-after-x:123")
     False
     """
     return fsname.snapshot.startswith(REVISION_PREFIX + ":")
@@ -301,15 +278,14 @@ def zfs(
     """
     thecmd, environ = _generate_zfs_command(cmd)
     with _enoent_is_spe():
-        with open(os.devnull, "rb") as devnull:
-            p = subprocess.run(
-                thecmd,
-                stdin=devnull,
-                capture_output=True,
-                check=False,
-                close_fds=True,
-                env=environ,
-            )
+        p = subprocess.run(
+            thecmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            close_fds=True,
+            env=environ,
+        )
     return _process_zfs_output(
         thecmd,
         p.returncode,
@@ -328,15 +304,14 @@ async def zfs_async(
     """
     thecmd, environ = _generate_zfs_command(cmd)
     with _enoent_is_spe():
-        with open(os.devnull, "rb") as devnull:
-            p = await asyncio.create_subprocess_exec(
-                *thecmd,
-                stdin=devnull,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environ,
-                close_fds=True,
-            )
+        p = await asyncio.create_subprocess_exec(
+            *thecmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environ,
+            close_fds=True,
+        )
     stdout, stderr = await p.communicate()
     returncode = await p.wait()
     return _process_zfs_output(
@@ -369,7 +344,7 @@ def _process_zfs_output(
     log: logging.Logger,
 ):
     thecmd_shell = " ".join(shlex.quote(x) for x in cmd)
-    err = "\n".join(line for line in stderr.decode().splitlines())
+    err = stderr.decode()
     if stdout:
         numlines = len(stdout.splitlines())
         if numlines > 2:
@@ -553,8 +528,16 @@ class ZFSPool(qubes.storage.Pool):
         # Intify.
         self.revisions_to_keep = int(self.revisions_to_keep)
         # Boolify.
-        self.ephemeral_volatile = boolify(self.ephemeral_volatile)
-        self.snap_on_start_forensics = boolify(snap_on_start_forensics)
+        self.ephemeral_volatile = qubes.property.bool(
+            None,
+            None,
+            self.ephemeral_volatile,
+        )
+        self.snap_on_start_forensics = qubes.property.bool(
+            None,
+            None,
+            snap_on_start_forensics,
+        )
         self._volume_objects_cache: Dict[Vid, ZFSVolume] = {}
         self._cached_usage_time = 0.0
         self._cached_size_time = 0.0
@@ -611,17 +594,17 @@ class ZFSPool(qubes.storage.Pool):
         )
 
         volume = ZFSVolume(
-            cfg["name"],
-            self,
-            vid,
-            revisions_to_keep,
-            cfg.get("rw", False),
-            cfg.get("save_on_stop", False),
-            cfg["size"],
-            cfg.get("snap_on_start", False),
-            cfg.get("source", None),
-            cfg.get("ephemeral"),
-            cfg.get("snap_on_start_forensics", False),
+            name=cfg["name"],
+            pool=self,
+            vid=vid,
+            revisions_to_keep=revisions_to_keep,
+            rw=cfg.get("rw", False),
+            save_on_stop=cfg.get("save_on_stop", False),
+            size=cfg["size"],
+            snap_on_start=cfg.get("snap_on_start", False),
+            source=cfg.get("source", None),
+            ephemeral=cfg.get("ephemeral"),
+            snap_on_start_forensics=cfg.get("snap_on_start_forensics", False),
         )
         self._volume_objects_cache[vid] = volume
         return volume
@@ -636,7 +619,7 @@ class ZFSPool(qubes.storage.Pool):
                 self.container,
                 log=self.log,
             )
-            val = ret.splitlines()[0].split("\t")
+            val = ret.splitlines()[0].split("\t")[1]
             if val != "true":
                 # Probably a root pool!  It already exists, but doesn't
                 # have the flag.  So we flag it here.  Mere existence
@@ -779,7 +762,7 @@ class ZFSPool(qubes.storage.Pool):
     @property
     def usage(self) -> int:
         """
-        Return usage of pool in percent (0-100).
+        Return usage of pool in bytes.
 
         Value is never queried to the backend more than once in 30 seconds.
         """
@@ -867,7 +850,7 @@ class ZFSPropertyCache:
         obj: Union[Volume, VolumeSnapshot],
         propname: ZFSPropertyKeys,
     ) -> Any:
-        """Set a cached value.  Returns None if not in cache."""
+        """Get a cached value.  Returns None if not in cache."""
         # Grab lock before performing operation!
         if obj not in self.cache:
             return None
@@ -1025,9 +1008,10 @@ class ZFSAccessor:
         # This is just for the cache to efficiently
         # set existence of a dataset and its parents.
         # Must call with cache lock grabbed.
-        for components, _ in enumerate(volume.split("/")):
+        splits = volume.split("/")
+        for components, _ in enumerate(splits):
             components += +1
-            dset = "/".join(volume.split("/")[:components])
+            dset = "/".join(splits[:components])
             if dataset_in_root(dset, self.root):
                 self._cache.set(Volume.make(dset), "exists", True)
 
@@ -1060,8 +1044,6 @@ class ZFSAccessor:
                     for row in res:
                         vol = Volume.make(row["name"])
                         self._cache.set(vol, "exists", True)
-                        if "creation" not in row:
-                            assert 0, row
                         if row["creation"] != "-":
                             crtn = int(row["creation"])
                             self._cache.set(vol, "creation", crtn)
@@ -1069,7 +1051,6 @@ class ZFSAccessor:
                         self._cache.set(vol, "readonly", rdnly)
                         drty = row["org.qubes:dirty"] == "on"
                         self._cache.set(vol, "org.qubes:dirty", drty)
-                        self._cache.set(vol, "creation", int(row["creation"]))
                 except qubes.storage.StoragePoolException:
                     pass
                 self._initialized = True
@@ -1104,16 +1085,27 @@ class ZFSAccessor:
                 # for all the volumes right away.  This is the
                 # most frequently-asked piece of information, so
                 # it makes sense to gather it right away.
+                props = [
+                    "name",
+                    "creation",
+                    "readonly",
+                    "org.qubes:dirty",
+                    "volsize",
+                ]
                 try:
                     res = self._get_prop_table(
-                        Volume.make(self.root),
-                        ["name"],
-                        log=log,
-                        recursive=True,
+                        Volume.make(self.root), props, log=log, recursive=True
                     )
                     for row in res:
                         vol = Volume.make(row["name"])
                         self._cache.set(vol, "exists", True)
+                        if row["creation"] != "-":
+                            crtn = int(row["creation"])
+                            self._cache.set(vol, "creation", crtn)
+                        rdnly = row["readonly"] == "on"
+                        self._cache.set(vol, "readonly", rdnly)
+                        drty = row["org.qubes:dirty"] == "on"
+                        self._cache.set(vol, "org.qubes:dirty", drty)
                 except qubes.storage.StoragePoolException:
                     pass
                 self._initialized = True
@@ -1846,8 +1838,9 @@ class ZFSVolume(qubes.storage.Volume):
         revisions_to_keep = int(revisions_to_keep)
         if snap_on_start or save_on_stop:
             # Non-volatile.  This type of dataset requires
-            # >= 1 revisions to keep, and >= 2 if revert
-            # is to work meaningfully at all.
+            # >= 1 revisions to keep if revert is to work
+            # meaningfully at all.  The semantics are now
+            # the same as the other drivers'.
             if revisions_to_keep < 1:
                 err = "ZFSVolume %s needs >= 1 revisions to keep" % vid
                 raise qubes.storage.StoragePoolException(err)
@@ -2275,28 +2268,18 @@ class ZFSVolume(qubes.storage.Volume):
 
     @property
     def usage(self) -> int:  # type: ignore
-        # For reviewers: it is unclear what the usage property of a volume
-        # actually means to the end user:
-        #
-        # * Is it the amount of bytes written by the VM's file system?
-        #   E.g the VM has written 1 MiB to its disk
-        #   -> usage = 1 MiB
-        #   This would be akin to the `logicalused` ZFS dataset property.
-        # * Is it the amount of bytes taken up by the volume on disk?
-        #   E.g. the VM wrote 1 MiB, but these were compressed to 4 KiB
-        #   -> usage = 4 KiB
-        #   This is what we show right now.
-        #
-        # The distinction is important because a ZFS volume 1 MiB in size
-        # can have up to 1 MiB written to it before -ENOSPC, but that does
-        # not mean the volume will occupy 1 MiB.  Due to compression, it may
-        # occupy substantially less.  Due to snapshots, the volume and its
-        # descendants may occupy substantially more (this is the current
-        # behavior -- to return bytes used by itself and all descendants).
-        # Ultimately in ZFS the "used" field only makes sense in the context
-        # of the pool-wide space usage.
-        #
-        # See zfsprops(7) for more info.
+        """
+        Return used size of dataset in bytes.
+
+        This usage data corresponds to the amount of logical bytes used in
+        the dataset.  The dataset can actually take more space in disk than
+        this number, because it can have snapshots, which are counted towards
+        the total disk space usage of the dataset.
+
+        However, this number matches the semantics expected by qui-disk-space.
+
+        See zfsprops(7) for more info.
+        """
         if not self.pool.accessor.volume_exists(self.volume, self.log):
             return 0
         return self.pool.accessor.get_volume_usage(
@@ -2718,10 +2701,10 @@ class ZFSVolume(qubes.storage.Volume):
                 size,
                 log=self.log,
             )
-            # Save the size of the volume so it is persisted in the
-            # config, and the volume can be recreated at the configured
-            # size if it is ever wiped/recreated.
-            self._size = size
+        # Save the size of the volume so it is persisted in the
+        # config, and the volume can be recreated at the configured
+        # size if it is ever wiped/recreated.
+        self._size = size
 
     def is_outdated(self) -> bool:
         """
