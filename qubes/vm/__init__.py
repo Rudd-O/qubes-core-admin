@@ -53,12 +53,15 @@ def validate_name(holder, prop, value):
 
     # this regexp does not contain '+'; if it had it, we should specifically
     # disallow 'lost+found' #1440
-    if re.match(r"^[a-zA-Z][a-zA-Z0-9_-]*$", value) is None:
+    if re.match(r"\A[a-zA-Z][a-zA-Z0-9_-]*\Z", value) is None:
         if holder is not None and prop is not None:
             raise qubes.exc.QubesPropertyValueError(holder, prop, value,
                 '{} value contains illegal characters'.format(prop.__name__))
         raise qubes.exc.QubesValueError(
             'VM name contains illegal characters')
+    if value == 'Domain-0':
+        raise qubes.exc.QubesValueError(
+            "VM name cannot be 'Domain-0'")
     if value in ('none', 'default'):
         raise qubes.exc.QubesValueError(
             'VM name cannot be \'none\' nor \'default\'')

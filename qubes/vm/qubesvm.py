@@ -40,6 +40,7 @@ import qubes.exc
 import qubes.storage
 import qubes.utils
 import qubes.vm
+import qubes.vm.adminvm
 import qubes.vm.mix.net
 
 qmemman_present = False
@@ -132,6 +133,9 @@ def _setter_virt_mode(self, prop, value):
 
 
 def _setter_kbd_layout(self, prop, value):
+    if not value.isascii():
+        raise qubes.exc.QubesPropertyValueError(
+            self, prop, value, "Keyboard layouts must be ASCII")
     untrusted_xkb_layout = value.split('+')
     if len(untrusted_xkb_layout) != 3:
         raise qubes.exc.QubesPropertyValueError(
@@ -141,8 +145,8 @@ def _setter_kbd_layout(self, prop, value):
     untrusted_variant = untrusted_xkb_layout[1]
     untrusted_options = untrusted_xkb_layout[2]
 
-    re_variant = r'^[a-zA-Z0-9-_]*$'
-    re_options = r'^[a-zA-Z0-9-_:,]*$'
+    re_variant = r'\A[a-zA-Z0-9-_]*\Z'
+    re_options = r'\A[a-zA-Z0-9-_:,]*\Z'
 
     if not untrusted_layout.isalpha():
         raise qubes.exc.QubesPropertyValueError(
@@ -956,6 +960,10 @@ class QubesVM(qubes.vm.mix.net.NetVMMixin, qubes.vm.BaseVM):
         return self.qid
 
     def __lt__(self, other):
+        if not isinstance(other, qubes.vm.BaseVM):
+            return NotImplemented
+        if isinstance(other, qubes.vm.adminvm.AdminVM):
+            return False
         return self.name < other.name
 
     def __xml__(self):
@@ -1394,8 +1402,24 @@ class QubesVM(qubes.vm.mix.net.NetVMMixin, qubes.vm.BaseVM):
 
         if list(self.devices['pci'].attached()):
             if self.features.check_with_template('qrexec', False):
-                await self.run_service_for_stdio('qubes.SuspendPre',
-                                                      user='root')
+                try:
+                    await asyncio.wait_for(
+                        self.run_service_for_stdio('qubes.SuspendPre',
+                                                   user='root'),
+                        qubes.config.suspend_timeout)
+                except subprocess.CalledProcessError as e:
+                    self.log.warning(
+                        "qubes.SuspendPre for %s failed with %d (stderr: %s), "
+                        "suspending anyway",
+                        self.name,
+                        e.returncode,
+                        qubes.utils.sanitize_stderr_for_log(e.stderr))
+                except asyncio.TimeoutError:
+                    self.log.warning(
+                        "qubes.SuspendPre for %s timed out after %d seconds, "
+                        "suspending anyway",
+                        self.name,
+                        qubes.config.suspend_timeout)
             self.libvirt_domain.pMSuspendForDuration(
                 libvirt.VIR_NODE_SUSPEND_TARGET_MEM, 0, 0)
         else:
@@ -1423,8 +1447,22 @@ class QubesVM(qubes.vm.mix.net.NetVMMixin, qubes.vm.BaseVM):
         if self.get_power_state() == "Suspended":
             self.libvirt_domain.pMWakeup()
             if self.features.check_with_template('qrexec', False):
-                await self.run_service_for_stdio('qubes.SuspendPost',
-                                                      user='root')
+                try:
+                    await asyncio.wait_for(
+                        self.run_service_for_stdio('qubes.SuspendPost',
+                                                   user='root'),
+                        qubes.config.suspend_timeout)
+                except subprocess.CalledProcessError as e:
+                    self.log.warning(
+                        "qubes.SuspendPost for %s failed with %d (stderr: %s)",
+                        self.name,
+                        e.returncode,
+                        qubes.utils.sanitize_stderr_for_log(e.stderr))
+                except asyncio.TimeoutError:
+                    self.log.warning(
+                        "qubes.SuspendPost for %s timed out after %d seconds",
+                        self.name,
+                        qubes.config.suspend_timeout)
         else:
             await self.unpause()
 
@@ -2235,10 +2273,12 @@ class QubesVM(qubes.vm.mix.net.NetVMMixin, qubes.vm.BaseVM):
 
         # TODO: Currently the whole qmemman is quite Xen-specific, so stay with
         # xenstore for it until decided otherwise
-        if qmemman_present:
+        if qmemman_present and self.maxmem:
+            xs_basedir = f"/local/domain/{self.xid}"
+            self.app.vmm.xs.write('',
+                                  f"{xs_basedir}/memory/meminfo", "")
             self.app.vmm.xs.set_permissions('',
-                                            '/local/domain/{}/memory'.format(
-                                                self.xid),
+                                            f"{xs_basedir}/memory/meminfo",
                                             [{'dom': self.xid}])
 
         self.fire_event('domain-qdb-create')

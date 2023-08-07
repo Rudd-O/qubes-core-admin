@@ -772,7 +772,7 @@ int main(int argc, char **argv) {
         # it is important to have some changing content there, to generate
         # content update events (aka damage notify)
         proc = await self.testvm1.run(
-            'xterm -maximized -e top')
+            'xterm -maximized -e top -d 5')
 
         if proc.returncode is not None:
             self.fail('xterm failed to start')
@@ -796,10 +796,10 @@ int main(int argc, char **argv) {
         # some memory
         alloc2 = await self.testvm1.run(
             'ulimit -l unlimited; /home/user/allocator {}'.format(memory_pages),
-            user='root', stdout=subprocess.PIPE)
+            user='root', stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         await alloc2.stdout.read(len('Stage1\n'))
 
-        # wait for damage notify - top updates every 3 sec by default
+        # wait for damage notify - top updates every 5 sec
         await asyncio.sleep(6)
 
         # stop changing the window content
@@ -814,8 +814,18 @@ int main(int argc, char **argv) {
         dom0_image = await asyncio.get_event_loop().run_in_executor(None,
             subprocess.check_output, ['import', '-window', winid, 'rgba:-'])
 
+        alloc2.terminate()
+        await alloc2.wait()
+        proc.terminate()
+        await proc.wait()
+
         if vm_image != dom0_image:
-            self.fail("Dom0 window doesn't match VM window content")
+            file_basename = f"/tmp/window-dump-{self.id()}-"
+            with open(file_basename + "vm", "wb") as f:
+                f.write(vm_image)
+            with open(file_basename + "dom0", "wb") as f:
+                f.write(dom0_image)
+            self.fail(f"Dom0 window doesn't match VM window content, saved to {file_basename}*")
 
 class TC_10_Generic(qubes.tests.SystemTestCase):
     def setUp(self):

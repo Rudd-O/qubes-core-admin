@@ -148,9 +148,8 @@ class FilePool(qubes.storage.Pool):
             stat_result = os.stat(path)
         except FileNotFoundError:
             return False
-        else:
-            assert stat.S_ISBLK(stat_result.st_mode), "not a block device?"
-            return True
+        assert stat.S_ISBLK(stat_result.st_mode), "not a block device?"
+        return True
 
     @property
     def revisions_to_keep(self):
@@ -332,7 +331,7 @@ class FileVolume(qubes.storage.Volume):
             given size is less than current_size
         '''
         if not self.rw:
-            msg = 'Can not resize reađonly volume {!s}'.format(self)
+            msg = 'Can not resize readonly volume {!s}'.format(self)
             raise qubes.storage.StoragePoolException(msg)
 
         if self.snap_on_start:
@@ -356,7 +355,7 @@ class FileVolume(qubes.storage.Volume):
                               stdout=subprocess.PIPE) as p:
             result = p.communicate()
 
-        m = re.match(r'^(/dev/loop\d+):\s', result[0].decode())
+        m = re.match(r'\A(/dev/loop\d+):\s', result[0].decode())
         if m is not None:
             loop_dev = m.group(1)
 

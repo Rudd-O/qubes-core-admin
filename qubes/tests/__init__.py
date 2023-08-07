@@ -32,6 +32,7 @@
 
 import asyncio
 import collections
+import contextlib
 import functools
 import logging
 import logging.handlers
@@ -169,6 +170,7 @@ class TestEmitter(qubes.events.Emitter):
 
         #: :py:class:`collections.Counter` instance
         self.fired_events = collections.Counter()
+        self.events_enabled = True
 
     def fire_event(self, event, **kwargs):
         effects = super(TestEmitter, self).fire_event(event, **kwargs)
@@ -385,6 +387,31 @@ class substitute_entry_points(object):
         self._orig_iter_entry_points = None
 
 
+class _clear_ex_info(contextlib.ContextDecorator):
+    """Remove local variables reference from tracebacks to allow garbage
+    collector to clean all Qubes*() objects, otherwise file descriptors
+    held by them will leak"""
+    def __init__(self, result_callback=None):
+        self._result_callback = result_callback
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._result_callback:
+            self._result_callback(
+                not exc_type or isinstance(exc_type, unittest.SkipTest)
+            )
+        if exc_val is None:
+            return
+        ex = exc_val
+        while ex is not None:
+            if isinstance(ex, qubes.exc.QubesVMError):
+                ex.vm = None
+            traceback.clear_frames(ex.__traceback__)
+            ex = ex.__context__
+
+
 class QubesTestCase(unittest.TestCase):
     """Base class for Qubes unit tests.
     """
@@ -394,8 +421,13 @@ class QubesTestCase(unittest.TestCase):
     _callTearDown   = never_awaited.detect()(unittest.TestCase._callTearDown)
     _callCleanup    = never_awaited.detect()(unittest.TestCase._callCleanup)
 
-    def __init__(self, *args, **kwargs):
-        super(QubesTestCase, self).__init__(*args, **kwargs)
+    def __init__(self, methodName='runTest'):
+        try:
+            test_method = getattr(self, methodName)
+            setattr(self, methodName, _clear_ex_info(self.set_result)(test_method))
+        except AttributeError:
+            pass
+        super(QubesTestCase, self).__init__(methodName)
         self.longMessage = True
         self.log = logging.getLogger('{}.{}.{}'.format(
             self.__class__.__module__,
@@ -404,12 +436,21 @@ class QubesTestCase(unittest.TestCase):
         self.addTypeEqualityFunc(qubes.devices.DeviceManager,
                                  self.assertDevicesEqual)
 
+        # decorate methods here, to catch also any overriden methods in subclasses
+        self.setUp = _clear_ex_info()(self.setUp)
+        self.tearDown = _clear_ex_info()(self.tearDown)
+
         self.loop = None
+
+        self._success = True
 
         global libvirt_event_impl
 
         if in_dom0 and not libvirt_event_impl:
             libvirt_event_impl = libvirtaio.virEventRegisterAsyncIOImpl()
+
+    def set_result(self, success):
+        self._success = success
 
     def __str__(self):
         return '{}/{}/{}'.format(
@@ -423,25 +464,6 @@ class QubesTestCase(unittest.TestCase):
 
         self.loop = asyncio.get_event_loop()
         self.addCleanup(self.cleanup_loop)
-        self.addCleanup(self.cleanup_traceback)
-
-    def cleanup_traceback(self):
-        """Remove local variables reference from tracebacks to allow garbage
-        collector to clean all Qubes*() objects, otherwise file descriptors
-        held by them will leak"""
-        exc_infos = [e for test_case, e in self._outcome.errors
-                     if test_case is self]
-        if self._outcome.expectedFailure:
-            exc_infos.append(self._outcome.expectedFailure)
-        for exc_info in exc_infos:
-            if exc_info is None:
-                continue
-            ex = exc_info[1]
-            while ex is not None:
-                if isinstance(ex, qubes.exc.QubesVMError):
-                    ex.vm = None
-                traceback.clear_frames(ex.__traceback__)
-                ex = ex.__context__
 
     def cleanup_gc(self):
         gc.collect()
@@ -509,11 +531,7 @@ class QubesTestCase(unittest.TestCase):
     def success(self):
         """Check if test was successful during tearDown """
 
-        result = self.defaultTestResult()
-        self._feedErrorsToResult(result, self._outcome.errors)
-
-        unsuccessful_tests = [test for (test,_) in (result.errors + result.failures)]
-        return self not in unsuccessful_tests
+        return self._success
 
     def assertNotRaises(self, excClass, callableObj=None, *args, **kwargs):
         """Fail if an exception of class excClass is raised
@@ -784,7 +802,7 @@ class SystemTestCase(QubesTestCase):
         del conn
 
         self.loop.run_until_complete(asyncio.wait([
-            server.wait_closed() for server in self.qubesd]))
+            self.loop.create_task(server.wait_closed()) for server in self.qubesd]))
         del self.qubesd
 
         # remove all references to any complex qubes objects, to release
@@ -1328,10 +1346,17 @@ class SystemTestCase(QubesTestCase):
             # first boot of whonix-ws takes more time because of /home
             # initialization, including Tor Browser copying
             timeout = 120
-        await asyncio.wait_for(
-            vm.run_service_for_stdio(
-                'qubes.WaitForSession', input=vm.default_user.encode()),
-            timeout=timeout)
+        try:
+            await asyncio.wait_for(
+                vm.run_service_for_stdio(
+                    'qubes.WaitForSession', input=vm.default_user.encode()),
+                timeout=timeout)
+        except asyncio.TimeoutError:
+            # collect some more info
+            stdout, _ = await vm.run_for_stdio('cat .xsession-errors')
+            self.log.error("VM {} xsession-errors on timeout: {}".format(
+                           vm.name, stdout.decode()))
+            raise
 
     async def start_vm(self, vm):
         """Start a VM and wait for it to be fully up"""

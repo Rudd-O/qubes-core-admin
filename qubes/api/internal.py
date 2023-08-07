@@ -175,9 +175,21 @@ class QubesInternalAPI(qubes.api.AbstractQubesAPI):
             except qubes.exc.QubesException as e:
                 vm.log.warning('Failed to run qubes.SuspendPreAll: %s', str(e))
 
-        # FIXME: some timeout?
         if processes:
-            await asyncio.wait([p.wait() for p in processes])
+            done, _ = await asyncio.wait([
+                    asyncio.create_task(
+                        asyncio.wait_for(p.wait(),
+                                         qubes.config.suspend_timeout))
+                    for p in processes])
+            for task in done:
+                try:
+                    task.result()
+                except asyncio.TimeoutError:
+                    self.app.log.warning(
+                        "some qube timed out after %d seconds on %s call",
+                        qubes.config.suspend_timeout,
+                        "qubes.SuspendPreAll"
+                    )
 
         coros = []
         # then suspend/pause VMs
@@ -185,9 +197,18 @@ class QubesInternalAPI(qubes.api.AbstractQubesAPI):
             if isinstance(vm, qubes.vm.adminvm.AdminVM):
                 continue
             if vm.is_running():
-                coros.append(vm.suspend())
+                coros.append(asyncio.create_task(vm.suspend()))
         if coros:
-            await asyncio.wait(coros)
+            done, _ = await asyncio.wait(coros)
+            failed = ""
+            for coro in done:
+                try:
+                    coro.result()
+                except Exception as e:  # pylint: disable=broad-except
+                    failed += f'\n{e!s}'
+            if failed:
+                raise qubes.exc.QubesException(
+                    "Failed to suspend some qubes: {}".format(failed))
 
     @qubes.api.method('internal.SuspendPost', no_payload=True)
     async def suspend_post(self):
@@ -203,7 +224,7 @@ class QubesInternalAPI(qubes.api.AbstractQubesAPI):
             if isinstance(vm, qubes.vm.adminvm.AdminVM):
                 continue
             if vm.get_power_state() in ["Paused", "Suspended"]:
-                coros.append(vm.resume())
+                coros.append(asyncio.create_task(vm.resume()))
         if coros:
             await asyncio.wait(coros)
 
@@ -226,6 +247,17 @@ class QubesInternalAPI(qubes.api.AbstractQubesAPI):
             except qubes.exc.QubesException as e:
                 vm.log.warning('Failed to run qubes.SuspendPostAll: %s', str(e))
 
-        # FIXME: some timeout?
         if processes:
-            await asyncio.wait([p.wait() for p in processes])
+            done, _ = await asyncio.wait(
+                    [asyncio.create_task(asyncio.wait_for(p.wait(),
+                                         qubes.config.suspend_timeout))
+                     for p in processes])
+            for task in done:
+                try:
+                    task.result()
+                except asyncio.TimeoutError:
+                    self.app.log.warning(
+                        "some qube timed out after %d seconds on %s call",
+                        qubes.config.suspend_timeout,
+                        "qubes.SuspendPostAll"
+                    )

@@ -269,7 +269,8 @@ async def void_coros_maybe(values):
         with each other. If there were exceptions, raise the leftmost
         one (not necessarily chronologically first). Return nothing.
     '''
-    coros = [val for val in values if asyncio.iscoroutine(val)]
+    coros = [asyncio.create_task(val) for val in values
+             if asyncio.iscoroutine(val)]
     if coros:
         done, _ = await asyncio.wait(coros)
         for task in done:
@@ -289,3 +290,16 @@ def cryptsetup(*args):
         check=True,
         sudo=True,
     )
+
+
+def sanitize_stderr_for_log(untrusted_stderr: bytes) -> str:
+    """Helper function to sanitize qrexec service stderr for logging"""
+    # limit size
+    untrusted_stderr = untrusted_stderr[:4096]
+    # limit to subset of printable ASCII, especially do not allow newlines,
+    # control characters etc
+    allowed = string.ascii_letters + string.digits + string.punctuation + ' '
+    allowed_bytes = allowed.encode()
+    stderr = bytes(b if b in allowed_bytes else b'_'[0]
+                   for b in untrusted_stderr)
+    return stderr.decode('ascii')

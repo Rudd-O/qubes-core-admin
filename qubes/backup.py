@@ -29,7 +29,6 @@ import itertools
 import logging
 import os
 import pwd
-import re
 import shutil
 import stat
 import string
@@ -63,8 +62,6 @@ HEADER_QUBES_XML_MAX_SIZE = 1024 * 1024
 HMAC_MAX_SIZE = 4096
 
 BLKSIZE = 512
-
-_re_alphanum = re.compile(r'^[A-Za-z0-9-]*$')
 
 
 class BackupCanceledError(qubes.exc.QubesException):
@@ -699,7 +696,7 @@ class Backup:
 
         if proc.returncode:
             if proc.stderr is not None:
-                proc_stderr = (await proc.stderr.read())
+                proc_stderr = await proc.stderr.read()
                 proc_stderr = proc_stderr.decode('ascii', errors='ignore')
                 proc_stderr = ''.join(
                     c for c in proc_stderr if c in string.printable and

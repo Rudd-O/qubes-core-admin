@@ -38,7 +38,7 @@ def _setter_mac(self, prop, value):
     if not isinstance(value, str):
         raise ValueError('MAC address must be a string')
     value = value.lower()
-    if re.match(r"^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$", value) is None:
+    if re.match(r"\A([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]\Z", value) is None:
         raise ValueError('Invalid MAC address value')
     return value
 
@@ -453,7 +453,7 @@ class NetVMMixin(qubes.events.Emitter):
 
         # don't check oldvalue, because it's missing if it was default
         if self.netvm is not None:
-            if self.is_running():
+            if self.is_running() and self.netvm.is_running():
                 self.detach_network()
 
     @qubes.events.handler('property-set:netvm')

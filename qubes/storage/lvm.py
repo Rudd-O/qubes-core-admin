@@ -338,7 +338,8 @@ class ThinVolume(qubes.storage.Volume):
     @property
     def size(self):
         try:
-            if self.is_dirty():
+            if (self.snap_on_start or self.save_on_stop) \
+               and os.path.exists('/dev/' + self._vid_snap):
                 return qubes.storage.lvm.size_cache[self._vid_snap]['size']
             return qubes.storage.lvm.size_cache[self._vid_current]['size']
         except KeyError:
@@ -578,6 +579,7 @@ class ThinVolume(qubes.storage.Volume):
             return False
         if self._vid_snap not in size_cache:
             return False
+        # pylint: disable=protected-access
         return (size_cache[self._vid_snap]['origin'] !=
                self.source.path.split('/')[-1])
 
@@ -611,7 +613,7 @@ class ThinVolume(qubes.storage.Volume):
             given size is less than current_size
         '''
         if not self.rw:
-            msg = 'Can not resize reađonly volume {!s}'.format(self)
+            msg = 'Can not resize readonly volume {!s}'.format(self)
             raise qubes.storage.StoragePoolException(msg)
 
         if size < self.size:
@@ -759,7 +761,7 @@ def _get_lvm_cmdline(cmd):
     action = cmd[0]
     if action == 'remove':
         assert len(cmd) == 2, 'wrong number of arguments for remove'
-        assert not cmd[1].startswith('/'), 'absolute path to ‘remove’???'
+        assert not cmd[1].startswith('/'), 'absolute path to \'remove\'???'
         assert '/' in cmd[1], 'refusing to delete entire volume group'
         lvm_cmd = ['lvremove', '--force', '--', cmd[1]]
     elif action == 'clone':
